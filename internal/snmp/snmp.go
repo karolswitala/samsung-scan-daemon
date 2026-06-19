@@ -65,22 +65,37 @@ func tlv(tag byte, value []byte) []byte {
 
 // buildGetRequest constructs a minimal SNMPv1 GET-Request PDU.
 func buildGetRequest(instanceID int) []byte {
-	oid := encodeOID(append(append([]int{}, oidBase...), instanceID))
+	arcs := make([]int, len(oidBase)+1)
+	copy(arcs, oidBase)
+	arcs[len(oidBase)] = instanceID
+
+	oid := encodeOID(arcs)
 	null := []byte{0x05, 0x00}
-	varbind := tlv(0x30, append(oid, null...))
+	varbind := tlv(0x30, concat(oid, null))
 	varbindList := tlv(0x30, varbind)
-	pdu := tlv(0xa0,
-		append(append(append(
-			tlv(0x02, []byte{0x01}), // request-id = 1
-			tlv(0x02, []byte{0x00})...), // error-status = 0
-			append(tlv(0x02, []byte{0x00}), varbindList...)...), // error-index = 0
-	))
-	return tlv(0x30,
-		append(append(
-			tlv(0x02, []byte{0x00}), // version SNMPv1
-			tlv(0x04, []byte(community))...,
-		), pdu...),
+
+	pduBody := concat(
+		tlv(0x02, []byte{0x01}), // request-id = 1
+		tlv(0x02, []byte{0x00}), // error-status = 0
+		tlv(0x02, []byte{0x00}), // error-index = 0
+		varbindList,
 	)
+	pdu := tlv(0xa0, pduBody)
+
+	msgBody := concat(
+		tlv(0x02, []byte{0x00}), // version SNMPv1
+		tlv(0x04, []byte(community)),
+		pdu,
+	)
+	return tlv(0x30, msgBody)
+}
+
+func concat(slices ...[]byte) []byte {
+	var out []byte
+	for _, s := range slices {
+		out = append(out, s...)
+	}
+	return out
 }
 
 // parseResponse extracts the 4-byte value from an SNMPv1 GET-Response.
@@ -106,7 +121,7 @@ func Poll(ip string, instanceID int, timeout time.Duration) (State, error) {
 	}
 	defer conn.Close()
 
-	conn.SetDeadline(time.Now().Add(timeout))
+	conn.SetDeadline(time.Now().Add(timeout)) //nolint:errcheck
 	if _, err := conn.Write(req); err != nil {
 		return Idle, err
 	}
@@ -118,16 +133,20 @@ func Poll(ip string, instanceID int, timeout time.Duration) (State, error) {
 		return Idle, nil
 	}
 
-	val := parseResponse(buf[:n])
+	return parseState(buf[:n]), nil
+}
+
+func parseState(data []byte) State {
+	val := parseResponse(data)
 	switch {
 	case bytesEqual(val, []byte{0x00, 0x00, 0x00, 0x01}),
 		bytesEqual(val, []byte{0x01, 0x00, 0x00, 0x00}):
-		return Triggered, nil
+		return Triggered
 	case bytesEqual(val, []byte{0x00, 0x00, 0x00, 0x02}),
 		bytesEqual(val, []byte{0x02, 0x00, 0x00, 0x00}):
-		return Ready, nil
+		return Ready
 	}
-	return Idle, nil
+	return Idle
 }
 
 func bytesEqual(a, b []byte) bool {

@@ -95,7 +95,7 @@ func buildParams(resolution int) []byte {
 // Download runs the Samsung Scan-to-PC TCP protocol and returns one page of raw JPEG data.
 // hasNextPage is true if the printer signalled that more pages are available.
 func Download(ip string, resolution int) (pageBytes []byte, hasNextPage bool, err error) {
-	addr := fmt.Sprintf("%s:%d", ip, port)
+	addr := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
 
 	// Probe connection — verify scanner is alive
 	probeConn, err := net.DialTimeout("tcp", addr, timeout)
