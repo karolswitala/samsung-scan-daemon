@@ -197,7 +197,11 @@ func Download(ip string, resolution int) (pageBytes []byte, hasNextPage bool, er
 		}
 	}
 
-	// Next-page check: send PARAMS until printer signals no more pages (status[1]==0x04)
+	// Next-page check: mirror Python's loop — keep sending PARAMS until the printer
+	// responds with status[1]==0x04 ("no more pages"). The printer may send several
+	// intermediate responses before the final 0x04; do not break early.
+	// Multi-page ADF support (breaking on a "next page ready" byte) requires a
+	// protocol capture with an ADF scan to identify the correct status byte value.
 	params := buildParams(resolution)
 	for {
 		if err := send(dataConn, params); err != nil {
@@ -211,12 +215,7 @@ func Download(ip string, resolution int) (pageBytes []byte, hasNextPage bool, er
 			hasNextPage = false
 			break
 		}
-		// Printer signalled another page is ready on this connection.
-		// Return current page so caller can collect it; caller will invoke Download again.
-		// Note: true multi-page on one TCP connection requires re-entering the POLL/FETCH
-		// loop without a new TCP handshake — flagged here for future hardware testing.
-		hasNextPage = true
-		break
+		// Any other status: printer still processing — keep looping.
 	}
 
 	// END + DISC

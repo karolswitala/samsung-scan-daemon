@@ -47,10 +47,11 @@ func (t *epmTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 // buildMultipart wraps xml in the EPM multipart envelope.
+// The Content-Type boundary must be UNQUOTED ("boundary=X", not "boundary=\"X\"")
+// because the Samsung printer's parser rejects the RFC-compliant quoted form.
 func buildMultipart(xmlBody string) (io.Reader, string) {
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
-	// The boundary must match exactly what Windows EPM Scan2PC sends.
 	w.SetBoundary(boundary)
 	h := make(map[string][]string)
 	h["Content-Disposition"] = []string{`form-data; name="EPMScan2PC_Post";filename=""`}
@@ -58,7 +59,9 @@ func buildMultipart(xmlBody string) (io.Reader, string) {
 	part, _ := w.CreatePart(h)
 	io.WriteString(part, xmlBody)
 	w.Close()
-	return &buf, w.FormDataContentType()
+	// Do NOT use w.FormDataContentType() — it quotes the boundary, which breaks the printer.
+	ct := "multipart/form-data; boundary=" + boundary
+	return &buf, ct
 }
 
 func post(ip, xmlBody string, timeout time.Duration) ([]byte, error) {
