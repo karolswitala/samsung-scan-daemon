@@ -20,6 +20,7 @@ var (
 	extra255       = makeResp255(0xa8, 0x00, 0x00, 0x00)
 	ack32          = makeAck32()
 	noMorePages255 = func() []byte { b := make([]byte, 255); b[0] = 0xa8; b[1] = 0x04; return b }()
+	nextPage255    = func() []byte { b := make([]byte, 255); b[0] = 0xa8; b[1] = 0x00; return b }()
 )
 
 func makeResp255(b0, b1, b2, b3 byte) []byte {
@@ -47,6 +48,11 @@ func makeChunkStatus(chunkSize int, isLast bool) []byte {
 	return s
 }
 
+func makeJPEGChunk(size int) []byte {
+	chunk := append([]byte{0xff, 0xd8, 0xff, 0xe0}, make([]byte, size)...)
+	return append(chunk, 0xff, 0xd9)
+}
+
 func recvExactTest(conn net.Conn, n int) []byte {
 	buf := make([]byte, n)
 	io.ReadFull(conn, buf)
@@ -55,28 +61,34 @@ func recvExactTest(conn net.Conn, n int) []byte {
 
 // --- ProtocolServer: printer-side mock ---
 
+// ProtocolServer simulates the printer TCP protocol.
+// pages[i][j] is chunk j of page i. Between pages, sends nextPage255 (0x00).
+// After the last page, sends noMorePages255 (0x04).
 type ProtocolServer struct {
-	jpeg_chunks [][]byte
-	received    [][]byte
-	listener    net.Listener
-	done        chan struct{}
+	pages    [][][]byte
+	received [][]byte
+	listener net.Listener
+	done     chan struct{}
 }
 
 func newProtocolServer(t *testing.T, chunks [][]byte) *ProtocolServer {
 	t.Helper()
 	if chunks == nil {
-		fakeJPEG := append([]byte{0xff, 0xd8, 0xff, 0xe0}, make([]byte, 400)...)
-		fakeJPEG = append(fakeJPEG, 0xff, 0xd9)
-		chunks = [][]byte{fakeJPEG}
+		chunks = [][]byte{makeJPEGChunk(400)}
 	}
+	return newMultiPageServer(t, [][][]byte{chunks})
+}
+
+func newMultiPageServer(t *testing.T, pages [][][]byte) *ProtocolServer {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	srv := &ProtocolServer{
-		jpeg_chunks: chunks,
-		listener:    ln,
-		done:        make(chan struct{}),
+		pages:    pages,
+		listener: ln,
+		done:     make(chan struct{}),
 	}
 	go srv.run()
 	return srv
@@ -110,35 +122,37 @@ func (s *ProtocolServer) handleData(conn net.Conn) {
 
 	s.record(recvExactTest(conn, 4))   // REQUEST
 	conn.Write(ack32)
-
-	s.record(recvExactTest(conn, 255)) // PARAMS
+	s.record(recvExactTest(conn, 255)) // PARAMS (initial)
 	conn.Write(caps255)
-
 	s.record(recvExactTest(conn, 255)) // EXTRA
 	conn.Write(extra255)
-
 	s.record(recvExactTest(conn, 25))  // DIMS
 	conn.Write(ack32)
-
 	s.record(recvExactTest(conn, 4))   // READY
 	conn.Write(ack32)
 
-	// POLL / FETCH loop
-	for i, chunk := range s.jpeg_chunks {
-		isLast := i == len(s.jpeg_chunks)-1
-		s.record(recvExactTest(conn, 4)) // POLL
-		conn.Write(makeChunkStatus(len(chunk), isLast))
-		s.record(recvExactTest(conn, 4)) // FETCH
-		conn.Write(chunk)
+	for pageIdx, pageChunks := range s.pages {
+		// POLL / FETCH loop for this page
+		for i, chunk := range pageChunks {
+			isLast := i == len(pageChunks)-1
+			s.record(recvExactTest(conn, 4)) // POLL
+			conn.Write(makeChunkStatus(len(chunk), isLast))
+			s.record(recvExactTest(conn, 4)) // FETCH
+			conn.Write(chunk)
+		}
+
+		// Next-page check response
+		s.record(recvExactTest(conn, 255)) // PARAMS (next-page)
+		if pageIdx == len(s.pages)-1 {
+			conn.Write(noMorePages255) // 0x04 — no more pages
+		} else {
+			conn.Write(nextPage255) // 0x00 — next page ready
+		}
 	}
 
-	// Next-page check
-	s.record(recvExactTest(conn, 255)) // PARAMS (next-page)
-	conn.Write(noMorePages255)
-
-	s.record(recvExactTest(conn, 4))   // END
+	s.record(recvExactTest(conn, 4)) // END
 	conn.Write(ack32)
-	s.record(recvExactTest(conn, 4))   // DISC
+	s.record(recvExactTest(conn, 4)) // DISC
 	conn.Write(ack32)
 }
 
@@ -164,116 +178,98 @@ func (s *ProtocolServer) Join() {
 	s.listener.Close()
 }
 
-func download(t *testing.T, srv *ProtocolServer, resolution int) []byte {
+func download(t *testing.T, srv *ProtocolServer, resolution int) [][]byte {
 	t.Helper()
-	// Override the port-level Download by dialing the mock directly
-	data, _, err := downloadOnPort("127.0.0.1", resolution, srv.Port())
+	pages, err := downloadOnPort("127.0.0.1", resolution, srv.Port())
 	if err != nil {
 		t.Fatalf("download error: %v", err)
 	}
-	return data
+	return pages
 }
 
-// downloadOnPort is Download with a configurable port — test-only.
-func downloadOnPort(ip string, resolution, tcpPort int) ([]byte, bool, error) {
+// downloadOnPort mirrors tcp.Download with a configurable port for testing.
+func downloadOnPort(ip string, resolution, tcpPort int) ([][]byte, error) {
 	addr := net.JoinHostPort(ip, itoa(tcpPort))
 
 	probeConn, err := net.Dial("tcp", addr)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	if err := handshake(probeConn); err != nil {
 		probeConn.Close()
-		return nil, false, err
+		return nil, err
 	}
 	probeConn.Close()
 
 	dataConn, err := net.Dial("tcp", addr)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	defer dataConn.Close()
 
 	if err := handshake(dataConn); err != nil {
-		return nil, false, err
+		return nil, err
 	}
 
-	if err := send(dataConn, magicRequest); err != nil {
-		return nil, false, err
-	}
-	if _, err := recvExact(dataConn, 32); err != nil {
-		return nil, false, err
-	}
+	send(dataConn, magicRequest)
+	recvExact(dataConn, 32)
 
-	if err := send(dataConn, buildParams(resolution)); err != nil {
-		return nil, false, err
-	}
-	if _, err := recvExact(dataConn, 255); err != nil {
-		return nil, false, err
-	}
+	params := buildParams(resolution)
+	send(dataConn, params)
+	recvExact(dataConn, 255)
 
 	extra := make([]byte, 255)
 	copy(extra, magicExtra)
-	if err := send(dataConn, extra); err != nil {
-		return nil, false, err
-	}
-	if _, err := recvExact(dataConn, 255); err != nil {
-		return nil, false, err
-	}
+	send(dataConn, extra)
+	recvExact(dataConn, 255)
 
 	dims := append(append([]byte{}, magicDims...), dimsA4...)
-	if err := send(dataConn, dims); err != nil {
-		return nil, false, err
-	}
-	if _, err := recvExact(dataConn, 32); err != nil {
-		return nil, false, err
-	}
+	send(dataConn, dims)
+	recvExact(dataConn, 32)
 
-	if err := send(dataConn, magicReady); err != nil {
-		return nil, false, err
-	}
-	if _, err := recvExact(dataConn, 32); err != nil {
-		return nil, false, err
-	}
+	send(dataConn, magicReady)
+	recvExact(dataConn, 32)
 
-	var chunks [][]byte
+	var pages [][]byte
 	for {
-		if err := send(dataConn, magicPoll); err != nil {
-			return nil, false, err
+		var chunks [][]byte
+		for {
+			send(dataConn, magicPoll)
+			status, _ := recvExact(dataConn, 32)
+			if status[1] != 0x00 {
+				continue
+			}
+			chunkSize := int(binary.BigEndian.Uint16(status[6:8]))
+			isLast := status[3] == 0x81
+			send(dataConn, magicFetch)
+			chunk, _ := recvExact(dataConn, chunkSize)
+			chunks = append(chunks, chunk)
+			if isLast {
+				break
+			}
 		}
-		status, err := recvExact(dataConn, 32)
-		if err != nil {
-			return nil, false, err
+
+		raw := make([]byte, 0)
+		for _, c := range chunks {
+			raw = append(raw, c...)
 		}
-		if status[1] != 0x00 {
-			continue
+		pages = append(pages, raw)
+
+		morePages := false
+		for {
+			send(dataConn, params)
+			nextStatus, _ := recvExact(dataConn, 255)
+			if nextStatus[1] == 0x04 {
+				break
+			}
+			if nextStatus[1] == 0x00 {
+				morePages = true
+				break
+			}
 		}
-		chunkSize := int(binary.BigEndian.Uint16(status[6:8]))
-		isLast := status[3] == 0x81
-		if err := send(dataConn, magicFetch); err != nil {
-			return nil, false, err
-		}
-		chunk, err := recvExact(dataConn, chunkSize)
-		if err != nil {
-			return nil, false, err
-		}
-		chunks = append(chunks, chunk)
-		if isLast {
+		if !morePages {
 			break
 		}
-	}
-
-	hasNextPage := false
-	params := buildParams(resolution)
-	if err := send(dataConn, params); err != nil {
-		return nil, false, err
-	}
-	nextStatus, err := recvExact(dataConn, 255)
-	if err != nil {
-		return nil, false, err
-	}
-	if nextStatus[1] != 0x04 {
-		hasNextPage = true
 	}
 
 	send(dataConn, magicEnd)
@@ -281,18 +277,14 @@ func downloadOnPort(ip string, resolution, tcpPort int) ([]byte, bool, error) {
 	send(dataConn, magicDisc)
 	recvExact(dataConn, 32)
 
-	var result []byte
-	for _, c := range chunks {
-		result = append(result, c...)
-	}
-	return result, hasNextPage, nil
+	return pages, nil
 }
 
 func itoa(n int) string {
-	s := ""
 	if n == 0 {
 		return "0"
 	}
+	s := ""
 	for n > 0 {
 		s = string(rune('0'+n%10)) + s
 		n /= 10
@@ -306,7 +298,6 @@ func TestProbeSendsCorrectMagic(t *testing.T) {
 	srv := newProtocolServer(t, nil)
 	download(t, srv, 300)
 	srv.Join()
-	// received[0] = probe info request
 	if string(srv.received[0]) != string(magicInfo) {
 		t.Errorf("want %x, got %x", magicInfo, srv.received[0])
 	}
@@ -316,7 +307,6 @@ func TestHandshakeSends255ByteProbe(t *testing.T) {
 	srv := newProtocolServer(t, nil)
 	download(t, srv, 300)
 	srv.Join()
-	// received[1] = first probe packet (255B)
 	if len(srv.received[1]) != 255 {
 		t.Errorf("probe packet: want 255B, got %d", len(srv.received[1]))
 	}
@@ -329,7 +319,6 @@ func TestScanRequestMagic(t *testing.T) {
 	srv := newProtocolServer(t, nil)
 	download(t, srv, 300)
 	srv.Join()
-	// Index 8 = data-connection REQUEST (after 4 probe + 4 data-handshake packets)
 	if string(srv.received[8]) != string(magicRequest) {
 		t.Errorf("want %x, got %x", magicRequest, srv.received[8])
 	}
@@ -339,7 +328,6 @@ func TestScanParamsResolution(t *testing.T) {
 	srv := newProtocolServer(t, nil)
 	download(t, srv, 150)
 	srv.Join()
-	// received[9] = PARAMS (255B)
 	params := srv.received[9]
 	if string(params[:4]) != string(magicParams) {
 		t.Errorf("params header: want %x, got %x", magicParams, params[:4])
@@ -386,27 +374,30 @@ func TestReadySignal(t *testing.T) {
 }
 
 func TestReturnsSingleChunk(t *testing.T) {
-	chunk := append([]byte{0xff, 0xd8}, make([]byte, 100)...)
-	chunk = append(chunk, 0xff, 0xd9)
+	chunk := makeJPEGChunk(100)
 	srv := newProtocolServer(t, [][]byte{chunk})
-	result := download(t, srv, 300)
+	pages := download(t, srv, 300)
 	srv.Join()
-	if string(result) != string(chunk) {
-		t.Errorf("chunk mismatch: want %d bytes, got %d bytes", len(chunk), len(result))
+	if len(pages) != 1 {
+		t.Fatalf("want 1 page, got %d", len(pages))
+	}
+	if string(pages[0]) != string(chunk) {
+		t.Errorf("chunk mismatch: want %d bytes, got %d bytes", len(chunk), len(pages[0]))
 	}
 }
 
 func TestReturnsMultipleChunksConcatenated(t *testing.T) {
-	chunkA := append([]byte{0xff, 0xd8}, make([]byte, 50)...)
-	chunkA = append(chunkA, 0xff, 0xd9)
-	chunkB := append([]byte{0xff, 0xd8}, make([]byte, 80)...)
-	chunkB = append(chunkB, 0xff, 0xd9)
+	chunkA := makeJPEGChunk(50)
+	chunkB := makeJPEGChunk(80)
 	srv := newProtocolServer(t, [][]byte{chunkA, chunkB})
-	result := download(t, srv, 300)
+	pages := download(t, srv, 300)
 	srv.Join()
+	if len(pages) != 1 {
+		t.Fatalf("want 1 page, got %d", len(pages))
+	}
 	want := append(chunkA, chunkB...)
-	if string(result) != string(want) {
-		t.Errorf("multi-chunk: want %d bytes, got %d bytes", len(want), len(result))
+	if string(pages[0]) != string(want) {
+		t.Errorf("multi-chunk: want %d bytes, got %d bytes", len(want), len(pages[0]))
 	}
 }
 
@@ -414,7 +405,6 @@ func TestEndSequenceSent(t *testing.T) {
 	srv := newProtocolServer(t, nil)
 	download(t, srv, 300)
 	srv.Join()
-	// With one chunk: received[16]=END, received[17]=DISC
 	n := len(srv.received)
 	if n < 18 {
 		t.Fatalf("too few packets received: %d", n)
@@ -424,5 +414,37 @@ func TestEndSequenceSent(t *testing.T) {
 	}
 	if string(srv.received[n-1]) != string(magicDisc) {
 		t.Errorf("DISC: want %x, got %x", magicDisc, srv.received[n-1])
+	}
+}
+
+func TestMultiPageADFDownload(t *testing.T) {
+	page1 := makeJPEGChunk(50)
+	page2 := makeJPEGChunk(80)
+	srv := newMultiPageServer(t, [][][]byte{{page1}, {page2}})
+	pages := download(t, srv, 300)
+	srv.Join()
+
+	if len(pages) != 2 {
+		t.Fatalf("want 2 pages, got %d", len(pages))
+	}
+	if string(pages[0]) != string(page1) {
+		t.Errorf("page 1 mismatch: want %d bytes, got %d", len(page1), len(pages[0]))
+	}
+	if string(pages[1]) != string(page2) {
+		t.Errorf("page 2 mismatch: want %d bytes, got %d", len(page2), len(pages[1]))
+	}
+}
+
+func TestMultiPageUsesOneTCPConnection(t *testing.T) {
+	page1 := makeJPEGChunk(50)
+	page2 := makeJPEGChunk(50)
+	srv := newMultiPageServer(t, [][][]byte{{page1}, {page2}})
+	pages := download(t, srv, 300)
+	srv.Join()
+
+	// Both pages must arrive; a new TCP connection per page would fail because
+	// the mock only accepts two connections total (probe + data).
+	if len(pages) != 2 {
+		t.Errorf("want 2 pages, got %d — possible extra TCP connection opened", len(pages))
 	}
 }

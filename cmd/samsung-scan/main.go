@@ -139,38 +139,34 @@ func run(ctx context.Context, ip, output string, pollInterval time.Duration) err
 }
 
 func downloadAndSave(ip, output string, resolution int, format string) error {
-	var pages [][]byte
-	for {
-		slog.Info("downloading page", "pageNum", len(pages)+1)
-		pageBytes, hasNextPage, err := tcp.Download(ip, resolution)
-		if err != nil {
-			return fmt.Errorf("download page %d: %w", len(pages)+1, err)
-		}
+	slog.Info("downloading")
+	rawPages, err := tcp.Download(ip, resolution)
+	if err != nil {
+		return fmt.Errorf("download: %w", err)
+	}
 
-		assembled, err := imageutil.AssembleStrips(pageBytes)
+	var pages [][]byte
+	for i, raw := range rawPages {
+		assembled, err := imageutil.AssembleStrips(raw)
 		if err != nil {
-			return fmt.Errorf("assemble strips page %d: %w", len(pages)+1, err)
+			return fmt.Errorf("assemble page %d: %w", i+1, err)
 		}
 		pages = append(pages, assembled)
-		slog.Info("page downloaded", "pageNum", len(pages))
-
-		if !hasNextPage {
-			break
-		}
 	}
+	slog.Info("download complete", "pages", len(pages))
 
 	ts := time.Now().Format("20060102_150405")
 	var (
 		data []byte
 		ext  string
-		err  error
 	)
 
 	isPDF := strings.Contains(format, "PDF")
 	if isPDF {
-		data, err = imageutil.PagesToPDF(pages)
-		if err != nil {
-			return fmt.Errorf("PDF generation: %w", err)
+		var pdfErr error
+		data, pdfErr = imageutil.PagesToPDF(pages)
+		if pdfErr != nil {
+			return fmt.Errorf("PDF generation: %w", pdfErr)
 		}
 		ext = "pdf"
 	} else {

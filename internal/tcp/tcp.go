@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"time"
 )
@@ -92,149 +93,166 @@ func buildParams(resolution int) []byte {
 	return pkt
 }
 
-// Download runs the Samsung Scan-to-PC TCP protocol and returns one page of raw JPEG data.
-// hasNextPage is true if the printer signalled that more pages are available.
-func Download(ip string, resolution int) (pageBytes []byte, hasNextPage bool, err error) {
+// Download runs the Samsung Scan-to-PC TCP protocol and returns all pages as raw JPEG data.
+// Single-page scans return a one-element slice. ADF multi-page scans return one entry per page,
+// all downloaded over the same TCP connection without reconnecting between pages.
+func Download(ip string, resolution int) (pages [][]byte, err error) {
 	addr := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
 
 	// Probe connection — verify scanner is alive
 	probeConn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
-		return nil, false, fmt.Errorf("probe connect: %w", err)
+		return nil, fmt.Errorf("probe connect: %w", err)
 	}
 	probeConn.SetDeadline(time.Now().Add(timeout))
 	if err := handshake(probeConn); err != nil {
 		probeConn.Close()
-		return nil, false, fmt.Errorf("probe handshake: %w", err)
+		return nil, fmt.Errorf("probe handshake: %w", err)
 	}
 	probeConn.Close()
 
 	// Data connection
 	dataConn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
-		return nil, false, fmt.Errorf("data connect: %w", err)
+		return nil, fmt.Errorf("data connect: %w", err)
 	}
 	defer dataConn.Close()
 	dataConn.SetDeadline(time.Now().Add(timeout))
 
 	if err := handshake(dataConn); err != nil {
-		return nil, false, fmt.Errorf("data handshake: %w", err)
+		return nil, fmt.Errorf("data handshake: %w", err)
 	}
 
 	// REQUEST
 	if err := send(dataConn, magicRequest); err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	if _, err := recvExact(dataConn, 32); err != nil {
-		return nil, false, fmt.Errorf("recv REQUEST ack: %w", err)
+		return nil, fmt.Errorf("recv REQUEST ack: %w", err)
 	}
 
 	// PARAMS
-	if err := send(dataConn, buildParams(resolution)); err != nil {
-		return nil, false, err
+	params := buildParams(resolution)
+	if err := send(dataConn, params); err != nil {
+		return nil, err
 	}
 	if _, err := recvExact(dataConn, 255); err != nil {
-		return nil, false, fmt.Errorf("recv PARAMS ack: %w", err)
+		return nil, fmt.Errorf("recv PARAMS ack: %w", err)
 	}
 
 	// EXTRA (all zeros)
 	extra := make([]byte, 255)
 	copy(extra, magicExtra)
 	if err := send(dataConn, extra); err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	if _, err := recvExact(dataConn, 255); err != nil {
-		return nil, false, fmt.Errorf("recv EXTRA ack: %w", err)
+		return nil, fmt.Errorf("recv EXTRA ack: %w", err)
 	}
 
 	// DIMS (A4 hardcoded)
 	dims := append(append([]byte{}, magicDims...), dimsA4...)
 	if err := send(dataConn, dims); err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	if _, err := recvExact(dataConn, 32); err != nil {
-		return nil, false, fmt.Errorf("recv DIMS ack: %w", err)
+		return nil, fmt.Errorf("recv DIMS ack: %w", err)
 	}
 
 	// READY
 	if err := send(dataConn, magicReady); err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	if _, err := recvExact(dataConn, 32); err != nil {
-		return nil, false, fmt.Errorf("recv READY ack: %w", err)
+		return nil, fmt.Errorf("recv READY ack: %w", err)
 	}
 
-	// POLL / FETCH loop
-	var chunks [][]byte
-	for {
-		if err := send(dataConn, magicPoll); err != nil {
-			return nil, false, err
-		}
-		status, err := recvExact(dataConn, 32)
-		if err != nil {
-			return nil, false, fmt.Errorf("recv POLL status: %w", err)
+	// Page download loop — stays on same TCP connection for all pages.
+	// After each page's chunks, the next-page check determines whether to
+	// re-enter the POLL/FETCH loop or proceed to END.
+	for pageNum := 1; ; pageNum++ {
+		// POLL / FETCH loop for current page
+		var chunks [][]byte
+		for {
+			if err := send(dataConn, magicPoll); err != nil {
+				return nil, fmt.Errorf("page %d POLL: %w", pageNum, err)
+			}
+			status, err := recvExact(dataConn, 32)
+			if err != nil {
+				return nil, fmt.Errorf("page %d recv POLL status: %w", pageNum, err)
+			}
+
+			if status[1] != 0x00 {
+				continue // scanner busy — keep polling
+			}
+
+			chunkSize := int(binary.BigEndian.Uint16(status[6:8]))
+			isLast := status[3] == 0x81
+
+			if err := send(dataConn, magicFetch); err != nil {
+				return nil, fmt.Errorf("page %d FETCH: %w", pageNum, err)
+			}
+			chunk, err := recvExact(dataConn, chunkSize)
+			if err != nil {
+				return nil, fmt.Errorf("page %d recv chunk: %w", pageNum, err)
+			}
+			chunks = append(chunks, chunk)
+
+			if isLast {
+				break
+			}
 		}
 
-		if status[1] != 0x00 {
-			// Scanner busy — keep polling
-			continue
+		raw := make([]byte, 0)
+		for _, c := range chunks {
+			raw = append(raw, c...)
+		}
+		pages = append(pages, raw)
+
+		// Next-page check: keep sending PARAMS until the printer signals done or ready.
+		//   0x04 — no more pages → proceed to END
+		//   0x00 — next page ready → re-enter POLL/FETCH on the same connection
+		//   other (e.g. 0x08) — printer still processing → send PARAMS again
+		// The debug log records the exact byte seen, which is useful for verifying
+		// ADF multi-page behavior during a real capture.
+		morePages := false
+		for {
+			if err := send(dataConn, params); err != nil {
+				return nil, fmt.Errorf("page %d next-page PARAMS: %w", pageNum, err)
+			}
+			nextStatus, err := recvExact(dataConn, 255)
+			if err != nil {
+				return nil, fmt.Errorf("page %d recv next-page status: %w", pageNum, err)
+			}
+			slog.Debug("next-page", "page", pageNum, "status", fmt.Sprintf("0x%02x", nextStatus[1]))
+			if nextStatus[1] == 0x04 {
+				break // no more pages
+			}
+			if nextStatus[1] == 0x00 {
+				morePages = true
+				break // next page ready — re-enter POLL/FETCH
+			}
+			// 0x08 or other: printer still processing — keep sending PARAMS
 		}
 
-		chunkSize := int(binary.BigEndian.Uint16(status[6:8]))
-		isLast := status[3] == 0x81
-
-		if err := send(dataConn, magicFetch); err != nil {
-			return nil, false, err
-		}
-		chunk, err := recvExact(dataConn, chunkSize)
-		if err != nil {
-			return nil, false, fmt.Errorf("recv chunk: %w", err)
-		}
-		chunks = append(chunks, chunk)
-
-		if isLast {
+		if !morePages {
 			break
 		}
-	}
-
-	// Next-page check: mirror Python's loop — keep sending PARAMS until the printer
-	// responds with status[1]==0x04 ("no more pages"). The printer may send several
-	// intermediate responses before the final 0x04; do not break early.
-	// Multi-page ADF support (breaking on a "next page ready" byte) requires a
-	// protocol capture with an ADF scan to identify the correct status byte value.
-	params := buildParams(resolution)
-	for {
-		if err := send(dataConn, params); err != nil {
-			return nil, false, err
-		}
-		nextStatus, err := recvExact(dataConn, 255)
-		if err != nil {
-			return nil, false, fmt.Errorf("recv next-page status: %w", err)
-		}
-		if nextStatus[1] == 0x04 {
-			hasNextPage = false
-			break
-		}
-		// Any other status: printer still processing — keep looping.
 	}
 
 	// END + DISC
 	if err := send(dataConn, magicEnd); err != nil {
-		return nil, hasNextPage, err
+		return nil, err
 	}
 	if _, err := recvExact(dataConn, 32); err != nil {
-		return nil, hasNextPage, fmt.Errorf("recv END ack: %w", err)
+		return nil, fmt.Errorf("recv END ack: %w", err)
 	}
 	if err := send(dataConn, magicDisc); err != nil {
-		return nil, hasNextPage, err
+		return nil, err
 	}
 	if _, err := recvExact(dataConn, 32); err != nil {
-		return nil, hasNextPage, fmt.Errorf("recv DISC ack: %w", err)
+		return nil, fmt.Errorf("recv DISC ack: %w", err)
 	}
 
-	result := make([]byte, 0)
-	for _, c := range chunks {
-		result = append(result, c...)
-	}
-	return result, hasNextPage, nil
+	return pages, nil
 }
