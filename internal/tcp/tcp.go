@@ -1,3 +1,56 @@
+// Package tcp implements the Samsung M2070W binary image download protocol on
+// TCP port 9400.
+//
+// # Connection sequence
+//
+// Every scan uses two sequential TCP connections to the same port:
+//
+//  1. Probe connection — handshake only, then close. Signals the printer that
+//     the client is reachable and arms the scan engine.
+//
+//  2. Data connection — full protocol:
+//     REQUEST → PARAMS → EXTRA → DIMS → READY → POLL/FETCH loop → END → DISC
+//
+// Each connection starts with two rounds of the same handshake:
+//
+//	PC → printer:  4 B   INFO request   (1b a8 12 00)
+//	printer → PC:  70 B  device info    (model name, capabilities)
+//	PC → printer:  255 B PROBE          (1b a8 13 fb + zeros)
+//	printer → PC:  255 B PROBE response
+//
+// # POLL / FETCH loop
+//
+// After READY the client polls until the scanner has a chunk ready:
+//
+//	POLL (4 B) → 32 B status
+//	  status[1] == 0x08: busy — poll again
+//	  status[1] == 0x00: chunk ready
+//	    chunk_size = BigEndian.Uint16(status[6:8])
+//	    is_last    = status[3] == 0x81
+//	  FETCH (4 B) → chunk_size bytes of raw JPEG strip data
+//
+// Each chunk is one independently-decodable JPEG covering 32 scan lines.
+// Chunks for a single page are concatenated and passed to imageutil.AssembleStrips.
+//
+// # Multi-page ADF
+//
+// After the last chunk of each page the client sends PARAMS (255 B) and reads
+// a 255-byte next-page status:
+//
+//	status[1] == 0x04: no more pages → END + DISC
+//	status[1] == 0x00: next page ready → re-enter POLL/FETCH on the same connection
+//	other:             printer still processing → send PARAMS again
+//
+// All pages are downloaded on the same data connection. Opening a new TCP
+// connection for each page causes the printer to respond with EOF.
+//
+// # Scan area
+//
+// The DIMS packet encodes the scan area in 1200-DPI units regardless of the
+// requested resolution. A4 values are hardcoded (8.27" × 11.69"):
+//
+//	width  = 9924  (0x26C4)
+//	height = 14028 (0x36CC)
 package tcp
 
 import (

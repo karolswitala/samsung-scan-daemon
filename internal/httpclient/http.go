@@ -1,3 +1,31 @@
+// Package httpclient handles the HTTP layer of the Samsung M2070W Scan-to-PC
+// protocol (TCP port 80).
+//
+// Three operations are used:
+//
+//   - Register / Deregister — S2PC_Regi ADD/DELETE creates or removes the named
+//     "My Mac" entry in the printer's scan destination list. Register returns the
+//     InstanceID assigned by the printer, which is used as the trailing SNMP OID
+//     arc for state polling.
+//
+//   - PostAppList — S2PC_AppList announces the scan profile for this machine so
+//     the printer marks it "Available" on the LCD. Must be sent while the SNMP
+//     state is "triggered" (user has the scan menu open). The printer never sends
+//     an HTTP response; the connection is abandoned after 8 seconds.
+//
+//   - GetUserSelect — reads /IDS/UserSelect.xml after the SNMP state reaches
+//     "ready". Returns the format, resolution, color, and scan size the user
+//     confirmed on the printer.
+//
+// All requests carry User-Agent: EPM Scan2PC and Connection: Keep-Alive; the
+// printer gates some responses on the User-Agent header.
+//
+// IMPORTANT: The multipart boundary in the Content-Type header must be unquoted.
+// Go's mime/multipart produces boundary="EPM Scan2PC Post Request" (RFC-correct).
+// The Samsung printer rejects this with an XML parse error. All POST requests
+// use a manually constructed Content-Type header:
+//
+//	Content-Type: multipart/form-data; boundary=EPM Scan2PC Post Request
 package httpclient
 
 import (

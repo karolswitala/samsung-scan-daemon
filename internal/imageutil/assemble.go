@@ -1,3 +1,26 @@
+// Package imageutil reassembles Samsung JPEG scan strips and produces the final
+// output files.
+//
+// # JPEG strip reassembly
+//
+// The Samsung M2070W delivers each scanned page as a stream of independent JPEG
+// images, each covering exactly 32 scan lines at the full page width. A typical
+// 300 DPI A4 scan produces ~110 strips. Simply concatenating the raw TCP chunks
+// creates a valid JPEG file, but decoders read only the first strip (a 32-line
+// sliver at the top of the page).
+//
+// AssembleStrips detects multiple SOI markers (0xff 0xd8) in the raw byte
+// stream, decodes each strip as a separate JPEG, composites them onto an RGBA
+// canvas in vertical order, and re-encodes the result at quality 95. If the
+// input contains only a single SOI marker the bytes are returned unchanged (the
+// fast path for short or single-strip scans).
+//
+// # PDF output
+//
+// PagesToPDF encodes a slice of assembled JPEG pages into a multi-page PDF using
+// github.com/go-pdf/fpdf. Each page is scaled to fit A4 (210 × 297 mm) at the
+// scanned aspect ratio — width-fitted, or height-fitted if the image is
+// unusually wide.
 package imageutil
 
 import (

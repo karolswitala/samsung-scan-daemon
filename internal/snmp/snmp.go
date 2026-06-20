@@ -1,3 +1,20 @@
+// Package snmp implements a minimal SNMPv1 GET client for polling the Samsung
+// M2070W printer state machine.
+//
+// The printer exposes a per-registration state OID:
+//
+//	1.3.6.1.4.1.236.11.5.11.81.11.7.2.1.2.{InstanceID}
+//
+// where InstanceID is returned by the S2PC_Regi ADD HTTP call. Querying this
+// OID over UDP port 161 returns one of three states: Idle (0x00), Triggered
+// (0x01, user opened the scan menu), or Ready (0x02, user confirmed the scan).
+//
+// The printer returns the value as an OCTET STRING (ASN.1 tag 0x04) rather than
+// an INTEGER; both tags are accepted. Both big-endian and little-endian 4-byte
+// encodings are observed in practice and both are handled.
+//
+// On timeout or any network error Poll returns Idle — a missing response is
+// treated as "no activity" rather than a fatal error.
 package snmp
 
 import (

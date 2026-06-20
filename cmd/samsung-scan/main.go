@@ -1,3 +1,22 @@
+// Command samsung-scan is a background daemon for the Samsung M2070W Scan-to-PC
+// protocol. It polls the printer via SNMP, registers this machine as a named
+// destination ("My Mac"), and downloads scans over TCP port 9400 whenever the
+// user initiates a scan from the printer's LCD.
+//
+// Usage:
+//
+//	samsung-scan --ip <printer-ip> [--output <dir>] [--poll <duration>] [--log-level <level>]
+//	samsung-scan --ip <printer-ip> --cleanup
+//
+// The format, resolution, and color mode are selected by the user on the printer
+// LCD and are read from UserSelect.xml after each scan; they are not CLI flags.
+//
+// Output files are written as scan_YYYYMMDD_HHMMSS.{pdf|jpg} in the --output
+// directory. PDF is used when the user selects any PDF format on the printer;
+// JPEG is the fallback.
+//
+// SIGINT and SIGTERM trigger a clean shutdown that deregisters this machine from
+// the printer before exiting.
 package main
 
 import (
