@@ -11,6 +11,8 @@ make build-mac                         # → dist/samsung-scan-macos (ARM64)
 make build-linux                       # → dist/samsung-scan-linux (AMD64, static)
 make test                              # 37 tests across 5 packages
 ./dist/samsung-scan-macos --ip 192.168.1.128 --output ~/Desktop --log-level debug
+# Flags: --ip (required), --output, --poll, --cleanup, --log-level
+# Resolution/color/format are NOT CLI flags — they come from the printer (GetUserSelect)
 ```
 
 ## Printer

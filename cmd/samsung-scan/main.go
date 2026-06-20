@@ -29,6 +29,15 @@ var resolutionMap = map[string]int{
 	"DPI_200": 200, "DPI_300": 300, "DPI_600": 600, "DPI_1200": 1200,
 }
 
+// defaultProfile is what we advertise to the printer LCD via PostAppList.
+// The actual scan parameters always come from GetUserSelect (the user's choice on the printer).
+var defaultProfile = httpclient.Profile{
+	Resolution: "DPI_300",
+	Color:      "COLOR_TRUE",
+	Format:     "FORMAT_M_PDF",
+	Size:       "SIZE_A4",
+}
+
 func uniqueID() string {
 	hostname, _ := os.Hostname()
 	sum := md5.Sum([]byte(hostname))
@@ -50,7 +59,8 @@ func setupLogger(level string) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: l})))
 }
 
-func run(ctx context.Context, ip, output string, profile httpclient.Profile, pollInterval time.Duration) error {
+func run(ctx context.Context, ip, output string, pollInterval time.Duration) error {
+	profile := defaultProfile
 	uid := uniqueID()
 
 	// Clean up stale registration from a previous run
@@ -179,9 +189,6 @@ func downloadAndSave(ip, output string, resolution int, format string) error {
 func main() {
 	ip := flag.String("ip", "", "Printer IP address (required)")
 	output := flag.String("output", expandHome("~/Desktop"), "Output directory for scanned files")
-	resolution := flag.String("resolution", "300", "Default DPI hint: 75/150/300/600/1200")
-	color := flag.String("color", "COLOR_TRUE", "Default color: COLOR_TRUE/COLOR_GRAY/COLOR_MONO")
-	format := flag.String("format", "FORMAT_M_PDF", "Default format hint: FORMAT_M_PDF/FORMAT_JPEG")
 	poll := flag.Duration("poll", 3*time.Second, "SNMP poll interval")
 	cleanup := flag.Bool("cleanup", false, "Deregister stale entries and exit")
 	logLevel := flag.String("log-level", "info", "Log level: debug/info/warn/error")
@@ -205,17 +212,10 @@ func main() {
 		return
 	}
 
-	profile := httpclient.Profile{
-		Resolution: fmt.Sprintf("DPI_%s", *resolution),
-		Color:      *color,
-		Format:     *format,
-		Size:       "SIZE_A4",
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx, *ip, *output, profile, *poll); err != nil {
+	if err := run(ctx, *ip, *output, *poll); err != nil {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
 	}
