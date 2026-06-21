@@ -5,6 +5,8 @@
 <dict>
     <key>Label</key>
     <string>com.local.samsung-scan</string>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
     <key>ProgramArguments</key>
     <array>
         <string>/usr/local/bin/samsung-scan</string>
@@ -18,8 +20,8 @@
     <key>ThrottleInterval</key>
     <integer>5</integer>
     <key>StandardOutPath</key>
-    <string>/tmp/samsung-scan.log</string>
+    <string>__HOME__/Library/Logs/samsung-scan.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/samsung-scan.log</string>
+    <string>__HOME__/Library/Logs/samsung-scan.log</string>
 </dict>
 </plist>

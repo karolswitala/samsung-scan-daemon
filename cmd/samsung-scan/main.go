@@ -1,7 +1,7 @@
-// Command samsung-scan is a background daemon for the Samsung M2070W Scan-to-PC
-// protocol. It polls the printer via SNMP, registers this machine as a named
-// destination ("My Mac"), and downloads scans over TCP port 9400 whenever the
-// user initiates a scan from the printer's LCD.
+// Command samsung-scan is a per-user LaunchAgent daemon for the Samsung M2070W
+// Scan-to-PC protocol. It polls the printer via SNMP, registers this machine as
+// a named destination ("My Mac"), and downloads scans over TCP port 9400 whenever
+// the user initiates a scan from the printer's LCD.
 //
 // Usage:
 //
@@ -15,9 +15,11 @@
 // directory. PDF is used when the user selects any PDF format on the printer;
 // JPEG is the fallback.
 //
-// When --output is omitted the daemon detects the currently active console user
-// at scan time (via /dev/console) and writes to /Users/{user}/Desktop. This
-// allows a single system daemon (running as root) to serve multiple user accounts.
+// When --output is omitted the daemon writes to the user's own Desktop directory.
+// Under fast user switching, each logged-in user runs their own agent instance;
+// only the active (foreground) console user registers with the printer and receives
+// scans. All users share the same printer identity ("My Mac") so exactly one scan
+// target appears on the LCD at all times.
 //
 // SIGINT and SIGTERM trigger a clean shutdown that deregisters this machine from
 // the printer before exiting.
@@ -30,9 +32,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"os/signal"
-	"os/user"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -89,32 +89,60 @@ func run(ctx context.Context, ip, outputFlag string, pollInterval time.Duration)
 	profile := defaultProfile
 	uid := uniqueID()
 
-	// Clean up stale registration from a previous run
+	// Clean up stale registration from a previous crashed run.
 	if err := httpclient.Deregister(ip, userID, uid); err != nil {
 		slog.Warn("startup deregister failed — stale entry with different UniqueID? Use --cleanup or curl to remove it manually", "err", err)
 	}
 
-	instanceID, err := httpclient.Register(ip, userID, uid)
-	if err != nil {
-		return fmt.Errorf("register: %w", err)
-	}
-	slog.Info("registered", "instanceID", instanceID, "slot", appIndex)
-	slog.Info("press Scan → PC → My Mac on the printer to scan")
-
-	defer func() {
-		slog.Info("deregistering")
-		httpclient.Deregister(ip, userID, uid)
-	}()
-
-	lastState := snmp.Idle
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
+
+	registered := false
+	var instanceID int
+	lastState := snmp.Idle
+
+	defer func() {
+		if registered {
+			slog.Info("deregistering")
+			httpclient.Deregister(ip, userID, uid)
+		}
+	}()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+		}
+
+		active := isActiveConsoleUser()
+
+		if !registered && active {
+			id, err := httpclient.Register(ip, userID, uid)
+			if err != nil {
+				slog.Warn("register failed", "err", err)
+				continue
+			}
+			instanceID = id
+			registered = true
+			lastState = snmp.Idle
+			slog.Info("registered", "instanceID", instanceID, "slot", appIndex)
+			slog.Info("press Scan → PC → My Mac on the printer to scan")
+			httpclient.PostAppList(ip, appIndex, profile)
+			continue
+		}
+
+		if registered && !active {
+			slog.Info("no longer active console user — deregistering")
+			httpclient.Deregister(ip, userID, uid)
+			registered = false
+			lastState = snmp.Idle
+			continue
+		}
+
+		if !registered {
+			slog.Debug("idle — not active console user")
+			continue
 		}
 
 		state, err := snmp.Poll(ip, instanceID, 2*time.Second)
@@ -209,13 +237,6 @@ func downloadAndSave(ip, output string, resolution int, format string) error {
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		return fmt.Errorf("write file: %w", err)
 	}
-	// When running as root, chown the file to match the output directory's owner
-	// so the user can manage the file in Finder without authenticating.
-	if info, err := os.Stat(output); err == nil {
-		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-			os.Chown(path, int(stat.Uid), int(stat.Gid))
-		}
-	}
 	slog.Info("scan saved", "path", path, "pages", len(pages), "format", ext, "bytes", len(data))
 	return nil
 }
@@ -255,34 +276,24 @@ func main() {
 	}
 }
 
-// consoleUser returns the username of the user currently logged in at the
-// Mac's display. Uses /dev/console, which reflects fast user switching correctly.
-func consoleUser() (string, error) {
-	out, err := exec.Command("stat", "-f", "%Su", "/dev/console").Output()
+// isActiveConsoleUser reports whether this process's user owns /dev/console,
+// which is the foreground GUI user on macOS and updates on fast user switching.
+func isActiveConsoleUser() bool {
+	info, err := os.Stat("/dev/console")
 	if err != nil {
-		return "", err
+		return false
 	}
-	u := strings.TrimSpace(string(out))
-	if u == "" || u == "root" {
-		return "", fmt.Errorf("no interactive user at console")
-	}
-	return u, nil
+	st, ok := info.Sys().(*syscall.Stat_t)
+	return ok && int(st.Uid) == os.Getuid()
 }
 
-// activeUserDesktop returns the Desktop path for the currently active console
-// user. Falls back to the daemon's own home directory if detection fails.
+// activeUserDesktop returns the Desktop path for the running user.
 func activeUserDesktop() string {
-	username, err := consoleUser()
+	home, err := os.UserHomeDir()
 	if err != nil {
-		slog.Warn("console user detection failed, falling back to daemon home", "err", err)
 		return expandHome("~/Desktop")
 	}
-	u, err := user.Lookup(username)
-	if err != nil {
-		slog.Warn("user lookup failed", "user", username, "err", err)
-		return expandHome("~/Desktop")
-	}
-	return filepath.Join(u.HomeDir, "Desktop")
+	return filepath.Join(home, "Desktop")
 }
 
 func expandHome(path string) string {
