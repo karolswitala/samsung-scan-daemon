@@ -20,12 +20,13 @@ Idle memory footprint: ~8 MB RSS. Static binary, no runtime dependencies.
 6. [Multi-user and fast user switching](#multi-user-and-fast-user-switching)
 7. [Running in Docker](#running-in-docker)
 8. [Flags](#flags)
-9. [How scanning works](#how-scanning-works)
-10. [Output formats](#output-formats)
-11. [Multi-page ADF scans](#multi-page-adf-scans)
-12. [Development](#development)
-13. [Troubleshooting](#troubleshooting)
-14. [Protocol reference](#protocol-reference)
+9. [Network guard](#network-guard)
+10. [How scanning works](#how-scanning-works)
+11. [Output formats](#output-formats)
+12. [Multi-page ADF scans](#multi-page-adf-scans)
+13. [Development](#development)
+14. [Troubleshooting](#troubleshooting)
+15. [Protocol reference](#protocol-reference)
 
 ---
 
@@ -140,14 +141,18 @@ your GUI session and restarts automatically if it crashes. It runs as you
 Run as your normal (non-root) user:
 
 ```bash
-./install.sh                   # prompts for printer IP (default 192.168.1.128)
-./install.sh 192.168.1.50     # or pass it directly
+./install.sh                          # prompts for printer IP (default 192.168.1.128)
+./install.sh 192.168.1.50            # pass IP directly
+./install.sh 192.168.1.50 30:cd:a7:b8:c7:e9   # pass IP + known MAC (skips ARP probe)
 ```
 
 This builds the binary, copies it to `/usr/local/bin/samsung-scan` (requires
 `sudo` for that one copy), installs the plist under `~/Library/LaunchAgents/`
 with your printer IP and home directory already substituted, and **loads the
 agent immediately**. Scans go to your Desktop automatically.
+
+If the printer is reachable at install time, `install.sh` auto-discovers its
+MAC via ARP and enables the network guard — see [Network guard](#network-guard).
 
 Re-running `./install.sh` with a new IP is safe — it unloads the old agent
 before reloading.
@@ -258,6 +263,7 @@ layer, no shell, no libc.
 | `--poll` | `3s` | SNMP poll interval (Go duration: `2s`, `500ms`, …) |
 | `--cleanup` | `false` | Deregister this machine from the printer and exit |
 | `--log-level` | `info` | Log verbosity: `debug`, `info`, `warn`, `error` |
+| `--enable-network-guard` | *(unset)* | Expected printer MAC; enables ARP-based network guard (macOS only) |
 
 ### Format, resolution, and color are not flags
 
@@ -274,6 +280,32 @@ run. Use when `My Mac` appears on the printer but the daemon is not running:
 ```bash
 ./dist/samsung-scan-macos --ip 192.168.1.128 --cleanup
 ```
+
+### Network guard
+
+On an untrusted network another device could claim the printer's IP address.
+`--enable-network-guard <mac>` makes the daemon verify the printer's MAC address
+via ARP before every registration — if the MAC doesn't match it stays idle and
+retries next tick instead of connecting to a stranger's device.
+
+`install.sh` discovers the MAC automatically and wires it in:
+
+```bash
+./install.sh 192.168.1.128        # discovers MAC at install time via arp
+./install.sh 192.168.1.128 30:cd:a7:b8:c7:e9   # or supply it yourself
+```
+
+To add the guard to an existing install, re-run `./install.sh` while the printer
+is online. To find the current MAC manually:
+
+```bash
+/usr/sbin/arp -n 192.168.1.128
+```
+
+**Docker / Linux:** `--enable-network-guard` is accepted but has no effect when
+`/usr/sbin/arp` is absent (e.g. a scratch container). A one-time log message
+explains the skip. Docker deployments run on a trusted local network so this is
+intentional, not a bug.
 
 ---
 

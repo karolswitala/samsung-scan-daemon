@@ -5,7 +5,7 @@
 //
 // Usage:
 //
-//	samsung-scan --ip <printer-ip> [--output <dir>] [--poll <duration>] [--log-level <level>]
+//	samsung-scan --ip <printer-ip> [--output <dir>] [--poll <duration>] [--log-level <level>] [--enable-network-guard <mac>]
 //	samsung-scan --ip <printer-ip> --cleanup
 //
 // The format, resolution, and color mode are selected by the user on the printer
@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -85,9 +86,21 @@ func setupLogger(level string) {
 }
 
 // outputFlag is "" when auto-detection is active, or an explicit path when --output is set.
-func run(ctx context.Context, ip, outputFlag string, pollInterval time.Duration) error {
+// expectedMAC is "" when the network guard is disabled, or a normalized MAC to verify via ARP.
+func run(ctx context.Context, ip, outputFlag string, pollInterval time.Duration, expectedMAC string) error {
 	profile := defaultProfile
 	uid := uniqueID()
+
+	// Disable the guard if /usr/sbin/arp is absent (e.g. Linux scratch container).
+	// Docker deployments run on trusted local networks and don't need the guard.
+	guardMAC := expectedMAC
+	if guardMAC != "" {
+		if _, err := exec.LookPath("/usr/sbin/arp"); err != nil {
+			slog.Info("network guard requested but /usr/sbin/arp not available on this platform — guard disabled",
+				"flag", "--enable-network-guard")
+			guardMAC = ""
+		}
+	}
 
 	// Clean up stale registration from a previous crashed run.
 	if err := httpclient.Deregister(ip, userID, uid); err != nil {
@@ -118,6 +131,22 @@ func run(ctx context.Context, ip, outputFlag string, pollInterval time.Duration)
 		active := isActiveConsoleUser()
 
 		if !registered && active {
+			if guardMAC != "" {
+				mac, err := lookupARPMAC(ip)
+				if err != nil {
+					slog.Warn("MAC lookup failed — skipping guard this tick", "err", err)
+				} else if mac == "" {
+					slog.Debug("printer not reachable via ARP — will retry")
+					continue
+				} else if mac != guardMAC {
+					slog.Warn("printer MAC mismatch — likely wrong network; not registering",
+						"expected", guardMAC, "got", mac)
+					continue
+				} else {
+					slog.Debug("printer MAC verified", "mac", mac)
+				}
+			}
+
 			id, err := httpclient.Register(ip, userID, uid)
 			if err != nil {
 				slog.Warn("register failed", "err", err)
@@ -247,6 +276,7 @@ func main() {
 	poll := flag.Duration("poll", 3*time.Second, "SNMP poll interval")
 	cleanup := flag.Bool("cleanup", false, "Deregister stale entries and exit")
 	logLevel := flag.String("log-level", "info", "Log level: debug/info/warn/error")
+	enableGuard := flag.String("enable-network-guard", "", "Expected printer MAC (e.g. 30:cd:a7:b8:c7:e9); enables ARP-based network guard (macOS only)")
 	flag.Parse()
 
 	setupLogger(*logLevel)
@@ -270,7 +300,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx, *ip, *output, *poll); err != nil {
+	if err := run(ctx, *ip, *output, *poll, normalizeMAC(*enableGuard)); err != nil {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
 	}
@@ -305,4 +335,43 @@ func expandHome(path string) string {
 		return filepath.Join(home, path[2:])
 	}
 	return path
+}
+
+// lookupARPMAC returns the normalized MAC address of the device at ip via
+// /usr/sbin/arp -n, which sends an active ARP probe if the entry is not cached.
+// Returns "" (no error) when the device does not respond to ARP.
+func lookupARPMAC(ip string) (string, error) {
+	out, err := exec.Command("/usr/sbin/arp", "-n", ip).Output()
+	if err != nil {
+		if len(out) > 0 && strings.Contains(string(out), "no entry") {
+			return "", nil
+		}
+		return "", fmt.Errorf("arp -n %s: %w", ip, err)
+	}
+	// "? (192.168.1.128) at 30:cd:a7:b8:c7:e9 on en0 ifscope [ethernet]"
+	line := string(out)
+	idx := strings.Index(line, " at ")
+	if idx < 0 {
+		return "", nil
+	}
+	fields := strings.Fields(line[idx+4:])
+	if len(fields) == 0 {
+		return "", nil
+	}
+	return normalizeMAC(fields[0]), nil
+}
+
+// normalizeMAC lowercases s and reformats it as colon-separated hex pairs,
+// accepting colons, dashes, or no separators as input.
+func normalizeMAC(s string) string {
+	s = strings.ToLower(s)
+	s = strings.NewReplacer(":", "", "-", "", ".", "").Replace(s)
+	if len(s) != 12 {
+		return s
+	}
+	pairs := make([]string, 6)
+	for i := range pairs {
+		pairs[i] = s[i*2 : i*2+2]
+	}
+	return strings.Join(pairs, ":")
 }
