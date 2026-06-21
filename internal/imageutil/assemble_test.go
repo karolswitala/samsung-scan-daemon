@@ -5,6 +5,7 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	"strings"
 	"testing"
 )
 
@@ -99,5 +100,38 @@ func TestPageToJPEG(t *testing.T) {
 	out := PageToJPEG(raw)
 	if !bytes.Equal(out, raw) {
 		t.Error("PageToJPEG should return input unchanged")
+	}
+}
+
+func TestCanvasHeightCap(t *testing.T) {
+	old := maxCanvasHeight
+	maxCanvasHeight = 10
+	defer func() { maxCanvasHeight = old }()
+
+	// Two strips of height 6 each; totalH = 12 > maxCanvasHeight(10).
+	strip1 := makeJPEG(10, 6, color.White)
+	strip2 := makeJPEG(10, 6, color.Black)
+	raw := append(strip1, strip2...)
+
+	_, err := AssembleStrips(raw)
+	if err == nil || !strings.Contains(err.Error(), "height") {
+		t.Errorf("expected canvas height cap error, got: %v", err)
+	}
+}
+
+func TestCanvasPixelCap(t *testing.T) {
+	old := maxCanvasPixels
+	maxCanvasPixels = 100
+	defer func() { maxCanvasPixels = old }()
+
+	// Two strips of width=8, height=7 each; totalH=14, width*totalH=112 > maxCanvasPixels(100).
+	// totalH=14 is well within the default maxCanvasHeight, so the height cap won't fire.
+	strip1 := makeJPEG(8, 7, color.White)
+	strip2 := makeJPEG(8, 7, color.Black)
+	raw := append(strip1, strip2...)
+
+	_, err := AssembleStrips(raw)
+	if err == nil || !strings.Contains(err.Error(), "pixel") {
+		t.Errorf("expected canvas pixel cap error, got: %v", err)
 	}
 }

@@ -33,6 +33,13 @@ import (
 	"github.com/go-pdf/fpdf"
 )
 
+// maxCanvasHeight and maxCanvasPixels guard against image-bomb inputs from the printer.
+// They are vars (not consts) so tests can override them with small sentinel values.
+var (
+	maxCanvasHeight = 100_000     // pixels; A4 @1200 DPI is ~14028
+	maxCanvasPixels = 100_000_000 // ~400 MB as RGBA; A4 @1200 DPI is ~139M
+)
+
 // AssembleStrips reassembles Samsung JPEG scan strips into a single JPEG image.
 // The printer delivers one page as N concatenated JPEG strips (each 32 scan lines).
 // Decoding the raw bytes gives only the first strip; this function composites them.
@@ -55,6 +62,12 @@ func AssembleStrips(raw []byte) ([]byte, error) {
 	}
 
 	width := images[0].Bounds().Dx()
+	if totalH > maxCanvasHeight {
+		return nil, fmt.Errorf("assembled height %d exceeds limit %d", totalH, maxCanvasHeight)
+	}
+	if width*totalH > maxCanvasPixels {
+		return nil, fmt.Errorf("canvas %dx%d exceeds pixel limit %d", width, totalH, maxCanvasPixels)
+	}
 	canvas := image.NewRGBA(image.Rect(0, 0, width, totalH))
 	y := 0
 	for _, img := range images {

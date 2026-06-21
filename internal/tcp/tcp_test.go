@@ -1,6 +1,8 @@
 package tcp
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/binary"
 	"io"
 	"net"
@@ -38,7 +40,8 @@ func makeAck32() []byte {
 func makeChunkStatus(chunkSize int, isLast bool) []byte {
 	s := make([]byte, 32)
 	s[0] = 0xa8
-	s[1] = 0x00 // chunk ready
+	s[1] = 0x00  // chunk ready
+	s[2] = 0x1d  // POLL status marker expected by Download
 	if isLast {
 		s[3] = 0x81
 	} else {
@@ -446,5 +449,18 @@ func TestMultiPageUsesOneTCPConnection(t *testing.T) {
 	// the mock only accepts two connections total (probe + data).
 	if len(pages) != 2 {
 		t.Errorf("want 2 pages, got %d — possible extra TCP connection opened", len(pages))
+	}
+}
+
+func TestReadJPEGStripSizeCap(t *testing.T) {
+	// Build a stream of zeros (no 0xff bytes) ending with a JPEG EOI marker.
+	// readJPEGStrip will accumulate all zeros via ReadBytes(0xff) before finding
+	// the EOI, exceeding maxStripBytes before it can return.
+	data := make([]byte, maxStripBytes+1000)
+	data = append(data, 0xff, 0xd9) // EOI
+	br := bufio.NewReader(bytes.NewReader(data))
+	_, err := readJPEGStrip(br)
+	if err == nil {
+		t.Fatal("expected strip size cap error, got nil")
 	}
 }

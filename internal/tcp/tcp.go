@@ -87,6 +87,12 @@ import (
 const (
 	port    = 9400
 	timeout = 30 * time.Second
+
+	maxStripBytes = 5 << 20   // 5 MB per JPEG strip
+	maxPageBytes  = 150 << 20 // 150 MB per page (A4 @1200 DPI)
+	maxTotalBytes = 500 << 20 // 500 MB per scan (ADF multi-page)
+	maxStrips     = 2000      // strips per page
+	maxPages      = 50        // pages per scan
 )
 
 var (
@@ -146,6 +152,9 @@ func readJPEGStrip(br *bufio.Reader) ([]byte, error) {
 		// ReadBytes(0xff) reads up to and including the next 0xff byte efficiently.
 		chunk, err := br.ReadBytes(0xff)
 		data = append(data, chunk...)
+		if len(data) > maxStripBytes {
+			return nil, fmt.Errorf("JPEG strip exceeds %d bytes", maxStripBytes)
+		}
 		if err != nil {
 			return data, err
 		}
@@ -281,6 +290,7 @@ func Download(ip string, resolution int) (pages [][]byte, err error) {
 	// Page download loop — stays on same TCP connection for all pages.
 	// After each page's chunks, the next-page check determines whether to
 	// re-enter the POLL/FETCH loop or proceed to END.
+	totalBytes := 0
 	for pageNum := 1; ; pageNum++ {
 		// Reset deadline for each page so page N+1 gets a full timeout window.
 		// Without this, a single 30-second window is shared across all pages;
@@ -289,6 +299,7 @@ func Download(ip string, resolution int) (pages [][]byte, err error) {
 
 		// POLL / FETCH loop for current page
 		var chunks [][]byte
+		pageBytes := 0
 		streamingActive := false // true once chunkSize=0 strips are seen on this page
 		for {
 			if err := send(dataConn, magicPoll); err != nil {
@@ -348,6 +359,13 @@ func Download(ip string, resolution int) (pages [][]byte, err error) {
 					return nil, fmt.Errorf("page %d streaming read: %w", pageNum, err)
 				}
 				chunks = append(chunks, strip)
+				pageBytes += len(strip)
+				if len(chunks) > maxStrips {
+					return nil, fmt.Errorf("page %d exceeds %d strips", pageNum, maxStrips)
+				}
+				if pageBytes > maxPageBytes {
+					return nil, fmt.Errorf("page %d exceeds %d bytes", pageNum, maxPageBytes)
+				}
 				if len(chunks)%25 == 0 {
 					slog.Info("streaming", "page", pageNum, "strips", len(chunks))
 				}
@@ -369,6 +387,13 @@ func Download(ip string, resolution int) (pages [][]byte, err error) {
 				return nil, fmt.Errorf("page %d recv chunk: %w", pageNum, err)
 			}
 			chunks = append(chunks, chunk)
+			pageBytes += len(chunk)
+			if len(chunks) > maxStrips {
+				return nil, fmt.Errorf("page %d exceeds %d strips", pageNum, maxStrips)
+			}
+			if pageBytes > maxPageBytes {
+				return nil, fmt.Errorf("page %d exceeds %d bytes", pageNum, maxPageBytes)
+			}
 
 			if isLast {
 				break
@@ -384,9 +409,16 @@ func Download(ip string, resolution int) (pages [][]byte, err error) {
 			break
 		}
 
+		if len(pages) >= maxPages {
+			return nil, fmt.Errorf("scan exceeds %d pages", maxPages)
+		}
 		raw := make([]byte, 0)
 		for _, c := range chunks {
 			raw = append(raw, c...)
+		}
+		totalBytes += len(raw)
+		if totalBytes > maxTotalBytes {
+			return nil, fmt.Errorf("scan exceeds %d total bytes", maxTotalBytes)
 		}
 		pages = append(pages, raw)
 
