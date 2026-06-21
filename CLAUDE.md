@@ -2,7 +2,7 @@
 
 ## What this is
 Go daemon that implements the reverse-engineered Samsung M2070W Scan-to-PC protocol.
-Reference Python implementation lives in `../mvp/`. Protocol spec in `../PROTOCOL.md`.
+Reference Python implementation lives in `../mvp/`. Protocol spec in `./PROTOCOL.md`.
 
 ## Build & run
 ```bash
@@ -43,12 +43,6 @@ responds with `status[1] == 0x04` ("no more pages"). The printer may send interm
 responses before the final `0x04`. Breaking on the first non-`0x04` byte was incorrectly
 treated as "another page ready", causing a second Download() call that failed with EOF.
 Mirrors Python's `while True: ... if status[1] == 0x04: break`.
-
-### 3. Multi-page ADF support is incomplete
-`Download()` returns `(bytes, hasNextPage=false, err)` — always false for now.
-True multi-page (ADF) requires knowing the printer's "next page ready" status byte,
-which needs a protocol capture with an actual multi-page ADF scan.
-The interface is already in place; the daemon loops on `hasNextPage` correctly.
 
 ## Architecture
 ```

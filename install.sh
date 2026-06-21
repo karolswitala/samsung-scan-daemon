@@ -10,6 +10,7 @@ echo "Building..."
 make build-mac
 
 echo "Installing binary to $DEST"
+mkdir -p "$(dirname "$DEST")"
 cp "$BINARY" "$DEST"
 
 echo "Installing LaunchAgent plist"

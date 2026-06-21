@@ -9,7 +9,8 @@
 //     the client is reachable and arms the scan engine.
 //
 //  2. Data connection — full protocol:
-//     REQUEST → PARAMS → EXTRA → DIMS → READY → POLL/FETCH loop → END → DISC
+//     REQUEST → PARAMS → EXTRA → DIMS → READY → POLL/FETCH loop
+//     → PARAMS (next-page check) → READY (re-arm) → POLL/FETCH loop → … → END → DISC
 //
 // Each connection starts with two rounds of the same handshake:
 //
@@ -32,14 +33,34 @@
 // Each chunk is one independently-decodable JPEG covering 32 scan lines.
 // Chunks for a single page are concatenated and passed to imageutil.AssembleStrips.
 //
+// # Mac firmware streaming mode (page 2+)
+//
+// On macOS-targeted firmware (Samsung M2070W), page 2 and beyond use a
+// streaming variant where chunk_size is always 0x0000 in the POLL status
+// and status[3] is 0x00 for every strip (never 0x81 "last strip").
+// The protocol is otherwise identical — FETCH still triggers each strip —
+// but the strip size is not announced upfront. Instead the client reads raw
+// bytes until the JPEG EOI marker (0xff 0xd9). The printer appends a small
+// number of padding bytes after each EOI before the next status block.
+//
+// End-of-streaming detection: after each strip the client sets a 2-second
+// deadline on the next POLL response. Normal strips reply within ~100 ms;
+// when there are no more strips the printer stops answering and the deadline
+// fires, signalling end-of-page. Additionally, status[2] != 0x1d or
+// status[1] == 0x04 in the POLL response are treated as explicit signals.
+//
 // # Multi-page ADF
 //
 // After the last chunk of each page the client sends PARAMS (255 B) and reads
 // a 255-byte next-page status:
 //
 //	status[1] == 0x04: no more pages → END + DISC
-//	status[1] == 0x00: next page ready → re-enter POLL/FETCH on the same connection
+//	status[1] == 0x00: next page ready → send READY (4 B) → recv 32 B ack
+//	                   → re-enter POLL/FETCH on the same connection
 //	other:             printer still processing → send PARAMS again
+//
+// The READY (0x31) command is required for every page, not just page 1. Without
+// it the printer does not arm the scan engine and returns blank dummy JPEGs.
 //
 // All pages are downloaded on the same data connection. Opening a new TCP
 // connection for each page causes the printer to respond with EOF.
@@ -54,6 +75,7 @@
 package tcp
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -104,15 +126,47 @@ func hexVal(c byte) byte {
 	return 0
 }
 
-func recvExact(conn net.Conn, n int) ([]byte, error) {
+func recvExact(r io.Reader, n int) ([]byte, error) {
 	buf := make([]byte, n)
-	_, err := io.ReadFull(conn, buf)
+	_, err := io.ReadFull(r, buf)
 	return buf, err
 }
 
 func send(conn net.Conn, data []byte) error {
 	_, err := conn.Write(data)
 	return err
+}
+
+// readJPEGStrip reads raw bytes from br until JPEG EOI (0xff 0xd9) inclusive.
+// Used in the Mac firmware streaming mode where the strip size is not announced
+// upfront (chunkSize=0) and the strip boundary is marked by the EOI marker.
+func readJPEGStrip(br *bufio.Reader) ([]byte, error) {
+	var data []byte
+	for {
+		// ReadBytes(0xff) reads up to and including the next 0xff byte efficiently.
+		chunk, err := br.ReadBytes(0xff)
+		data = append(data, chunk...)
+		if err != nil {
+			return data, err
+		}
+		// Check if the byte after 0xff is 0xd9 (JPEG EOI).
+		next, err := br.ReadByte()
+		if err != nil {
+			return data, err
+		}
+		data = append(data, next)
+		if next == 0xd9 {
+			return data, nil
+		}
+	}
+}
+
+// drainPostEOIPadding discards the 16 padding bytes the printer appends after
+// each JPEG EOI in streaming mode. The padding is always exactly 16 bytes with
+// variable content — it can contain any byte value including 0xa8.
+func drainPostEOIPadding(conn net.Conn, br *bufio.Reader) {
+	conn.SetDeadline(time.Now().Add(timeout))
+	recvExact(br, 16)
 }
 
 // handshake performs two rounds of: 4B info → 70B response → 255B probe → 255B response.
@@ -176,11 +230,15 @@ func Download(ip string, resolution int) (pages [][]byte, err error) {
 		return nil, fmt.Errorf("data handshake: %w", err)
 	}
 
+	// Wrap the data connection in a buffered reader for efficient byte-level reads
+	// (needed for JPEG EOI detection in streaming mode).
+	br := bufio.NewReaderSize(dataConn, 65536)
+
 	// REQUEST
 	if err := send(dataConn, magicRequest); err != nil {
 		return nil, err
 	}
-	if _, err := recvExact(dataConn, 32); err != nil {
+	if _, err := recvExact(br, 32); err != nil {
 		return nil, fmt.Errorf("recv REQUEST ack: %w", err)
 	}
 
@@ -189,7 +247,7 @@ func Download(ip string, resolution int) (pages [][]byte, err error) {
 	if err := send(dataConn, params); err != nil {
 		return nil, err
 	}
-	if _, err := recvExact(dataConn, 255); err != nil {
+	if _, err := recvExact(br, 255); err != nil {
 		return nil, fmt.Errorf("recv PARAMS ack: %w", err)
 	}
 
@@ -199,7 +257,7 @@ func Download(ip string, resolution int) (pages [][]byte, err error) {
 	if err := send(dataConn, extra); err != nil {
 		return nil, err
 	}
-	if _, err := recvExact(dataConn, 255); err != nil {
+	if _, err := recvExact(br, 255); err != nil {
 		return nil, fmt.Errorf("recv EXTRA ack: %w", err)
 	}
 
@@ -208,7 +266,7 @@ func Download(ip string, resolution int) (pages [][]byte, err error) {
 	if err := send(dataConn, dims); err != nil {
 		return nil, err
 	}
-	if _, err := recvExact(dataConn, 32); err != nil {
+	if _, err := recvExact(br, 32); err != nil {
 		return nil, fmt.Errorf("recv DIMS ack: %w", err)
 	}
 
@@ -216,7 +274,7 @@ func Download(ip string, resolution int) (pages [][]byte, err error) {
 	if err := send(dataConn, magicReady); err != nil {
 		return nil, err
 	}
-	if _, err := recvExact(dataConn, 32); err != nil {
+	if _, err := recvExact(br, 32); err != nil {
 		return nil, fmt.Errorf("recv READY ack: %w", err)
 	}
 
@@ -224,28 +282,89 @@ func Download(ip string, resolution int) (pages [][]byte, err error) {
 	// After each page's chunks, the next-page check determines whether to
 	// re-enter the POLL/FETCH loop or proceed to END.
 	for pageNum := 1; ; pageNum++ {
+		// Reset deadline for each page so page N+1 gets a full timeout window.
+		// Without this, a single 30-second window is shared across all pages;
+		// page 1 consumes most of it and page 2 times out before it can complete.
+		dataConn.SetDeadline(time.Now().Add(timeout))
+
 		// POLL / FETCH loop for current page
 		var chunks [][]byte
+		streamingActive := false // true once chunkSize=0 strips are seen on this page
 		for {
 			if err := send(dataConn, magicPoll); err != nil {
 				return nil, fmt.Errorf("page %d POLL: %w", pageNum, err)
 			}
-			status, err := recvExact(dataConn, 32)
+			status, err := recvExact(br, 32)
 			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() && streamingActive {
+					// 2 s streaming deadline expired: the printer stopped responding
+					// to POLL after the last strip. Proceed to the next-page check.
+					slog.Info("streaming done", "page", pageNum, "strips", len(chunks))
+					dataConn.SetDeadline(time.Now().Add(timeout))
+					break
+				}
 				return nil, fmt.Errorf("page %d recv POLL status: %w", pageNum, err)
 			}
+			dataConn.SetDeadline(time.Now().Add(timeout))
 
+			// status[2] == 0x1d is the fixed marker for a 32 B POLL status response.
+			// If the printer instead replies with a 255 B PARAMS-style packet (e.g. to
+			// signal end-of-streaming), drain the remaining 223 bytes and break.
+			if status[2] != 0x1d {
+				slog.Debug("streaming page done (non-POLL response)", "page", pageNum,
+					"status1", fmt.Sprintf("0x%02x", status[1]), "strips", len(chunks))
+				if _, err := recvExact(br, 255-32); err != nil {
+					slog.Warn("drain 255B response tail", "page", pageNum, "err", err)
+				}
+				break
+			}
+
+			if status[1] == 0x04 {
+				// Printer explicitly signals end-of-page via the POLL status byte.
+				slog.Debug("streaming page done (status[1]=0x04)", "page", pageNum, "strips", len(chunks))
+				break
+			}
 			if status[1] != 0x00 {
-				continue // scanner busy — keep polling
+				continue // scanner busy (0x08) — keep polling
 			}
 
 			chunkSize := int(binary.BigEndian.Uint16(status[6:8]))
 			isLast := status[3] == 0x81
 
+			if chunkSize == 0 {
+				// Mac firmware streaming mode: printer returns chunkSize=0 for every
+				// strip instead of announcing the size upfront. FETCH triggers the strip;
+				// read raw bytes until JPEG EOI (0xff 0xd9); drain any post-EOI padding.
+				if !streamingActive {
+					slog.Info("streaming mode", "page", pageNum)
+				}
+				streamingActive = true
+				slog.Debug("streaming strip", "page", pageNum, "strip", len(chunks)+1, "isLast", isLast)
+				if err := send(dataConn, magicFetch); err != nil {
+					return nil, fmt.Errorf("page %d streaming FETCH: %w", pageNum, err)
+				}
+				strip, err := readJPEGStrip(br)
+				if err != nil {
+					return nil, fmt.Errorf("page %d streaming read: %w", pageNum, err)
+				}
+				chunks = append(chunks, strip)
+				if len(chunks)%25 == 0 {
+					slog.Info("streaming", "page", pageNum, "strips", len(chunks))
+				}
+				drainPostEOIPadding(dataConn, br)
+				if isLast {
+					break
+				}
+				// Short deadline for next POLL: normal strips arrive within ~100 ms;
+				// if there are no more strips the printer won't respond.
+				dataConn.SetDeadline(time.Now().Add(2 * time.Second))
+				continue
+			}
+
 			if err := send(dataConn, magicFetch); err != nil {
 				return nil, fmt.Errorf("page %d FETCH: %w", pageNum, err)
 			}
-			chunk, err := recvExact(dataConn, chunkSize)
+			chunk, err := recvExact(br, chunkSize)
 			if err != nil {
 				return nil, fmt.Errorf("page %d recv chunk: %w", pageNum, err)
 			}
@@ -254,6 +373,15 @@ func Download(ip string, resolution int) (pages [][]byte, err error) {
 			if isLast {
 				break
 			}
+		}
+
+		// If the POLL loop exited with no strips the printer had no data for this
+		// page — either a premature PARAMS 0x00 or a stream misalignment. Entering
+		// the PARAMS next-page check here causes an immediate morePages=true loop
+		// that makes the printer LCD show "scan another page?" without scanning.
+		if len(chunks) == 0 {
+			slog.Warn("page had no strips — stopping scan", "page", pageNum)
+			break
 		}
 
 		raw := make([]byte, 0)
@@ -273,7 +401,7 @@ func Download(ip string, resolution int) (pages [][]byte, err error) {
 			if err := send(dataConn, params); err != nil {
 				return nil, fmt.Errorf("page %d next-page PARAMS: %w", pageNum, err)
 			}
-			nextStatus, err := recvExact(dataConn, 255)
+			nextStatus, err := recvExact(br, 255)
 			if err != nil {
 				return nil, fmt.Errorf("page %d recv next-page status: %w", pageNum, err)
 			}
@@ -282,6 +410,15 @@ func Download(ip string, resolution int) (pages [][]byte, err error) {
 				break // no more pages
 			}
 			if nextStatus[1] == 0x00 {
+				// Re-arm the scanner for the next page. Without this the printer
+				// never starts scanning and returns blank dummy JPEGs indefinitely.
+				// Confirmed by Windows and Mac traces: both send READY (0x31) here.
+				if err := send(dataConn, magicReady); err != nil {
+					return nil, fmt.Errorf("page %d next-page READY: %w", pageNum, err)
+				}
+				if _, err := recvExact(br, 32); err != nil {
+					return nil, fmt.Errorf("page %d next-page READY ack: %w", pageNum, err)
+				}
 				morePages = true
 				break // next page ready — re-enter POLL/FETCH
 			}
@@ -297,13 +434,13 @@ func Download(ip string, resolution int) (pages [][]byte, err error) {
 	if err := send(dataConn, magicEnd); err != nil {
 		return nil, err
 	}
-	if _, err := recvExact(dataConn, 32); err != nil {
+	if _, err := recvExact(br, 32); err != nil {
 		return nil, fmt.Errorf("recv END ack: %w", err)
 	}
 	if err := send(dataConn, magicDisc); err != nil {
 		return nil, err
 	}
-	if _, err := recvExact(dataConn, 32); err != nil {
+	if _, err := recvExact(br, 32); err != nil {
 		return nil, fmt.Errorf("recv DISC ack: %w", err)
 	}
 
