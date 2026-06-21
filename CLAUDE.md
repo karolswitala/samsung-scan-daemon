@@ -2,34 +2,34 @@
 
 ## What this is
 Go daemon that implements the reverse-engineered Samsung M2070W Scan-to-PC protocol.
-Reference Python implementation lives in `../mvp/`. Protocol spec in `./PROTOCOL.md`.
+Protocol spec in `./PROTOCOL.md`.
 
 ## Build & run
 ```bash
-export PATH=$PATH:/usr/local/go/bin   # Go is at /usr/local/go/bin/go
 make build-mac                         # → dist/samsung-scan-macos (ARM64)
 make build-linux                       # → dist/samsung-scan-linux (AMD64, static)
-make test                              # 37 tests across 5 packages
-./dist/samsung-scan-macos --ip 192.168.1.128 --output ~/Desktop --log-level debug
+make test                              # unit tests across all packages
+./dist/samsung-scan-macos --ip <printer-ip> --log-level debug
 # Flags: --ip (required), --output, --poll, --cleanup, --log-level
 # Resolution/color/format are NOT CLI flags — they come from the printer (GetUserSelect)
 ```
 
+Go must be on PATH. If not found: `export PATH=$PATH:/usr/local/go/bin`
+
 ## Printer
-- IP: `192.168.1.128` (Samsung M2070W)
 - Before registering, check for stale `My Mac` entries — deregister first or use `--cleanup`
 - The daemon deregisters at startup automatically, but if a previous run crashed the entry
   may have a different UniqueID; delete it manually via curl if needed:
   ```bash
   BOUNDARY="EPM Scan2PC Post Request"
   printf -- "--${BOUNDARY}\r\nContent-Disposition: form-data; name=\"EPMScan2PC_Post\";filename=\"\"\r\nContent-Type: application/octet-stream\r\n\r\n<?xml version=\"1.0\" encoding=\"utf-8\"?><root><S2PC_Regi RegiType=\"DELETE\" UserID=\"My Mac\" UniqueID=\"REPLACE_ME\" /></root>\r\n--${BOUNDARY}--\r\n" | \
-    curl -s -X POST "http://192.168.1.128/IDS/ScanFaxToPC.cgi" \
+    curl -s -X POST "http://<printer-ip>/IDS/ScanFaxToPC.cgi" \
     -H "Content-Type: multipart/form-data; boundary=${BOUNDARY}" \
     -H "User-Agent: EPM Scan2PC" --data-binary @-
   ```
-- Our machine's UniqueID: `877a91c4c5ce9836` (MD5 of hostname, first 16 hex chars)
+  Replace `REPLACE_ME` with the stale UniqueID from the printer's web UI, and `<printer-ip>` with your printer's IP.
 
-## Protocol gotchas (bugs found in live testing)
+## Protocol gotchas
 
 ### 1. Multipart boundary must NOT be quoted
 Go's `mime/multipart` produces `boundary="EPM Scan2PC Post Request"` (RFC-correct).
@@ -39,10 +39,9 @@ Fixed in `internal/httpclient/http.go` — do not use `w.FormDataContentType()`.
 
 ### 2. Next-page check loop must keep iterating
 After the POLL/FETCH image download, the client sends PARAMS and loops until the printer
-responds with `status[1] == 0x04` ("no more pages"). The printer may send intermediate
-responses before the final `0x04`. Breaking on the first non-`0x04` byte was incorrectly
-treated as "another page ready", causing a second Download() call that failed with EOF.
-Mirrors Python's `while True: ... if status[1] == 0x04: break`.
+responds with `status[1] == 0x04` ("no more pages"). The printer sends intermediate
+`0x08` responses while the ADF feeds the next page. Breaking early on any non-`0x04`
+byte causes the connection to desync.
 
 ## Architecture
 ```
@@ -64,10 +63,10 @@ internal/imageutil/            — JPEG strip assembly, multi-page PDF (go-pdf/f
 ## Output formats
 - `FORMAT_S_PDF` / `FORMAT_M_PDF` (contains "PDF") → saves `.pdf` via go-pdf/fpdf
 - `FORMAT_JPEG` or anything else → saves `.jpg` (first page only)
-- Filename: `scan_YYYYMMDD_HHMMSS.{ext}` in `--output` directory
+- Filename: `scan_YYYYMMDD_HHMMSS.{ext}` in the output directory
 
-## Shell hygiene reminder
-When launching the daemon for testing, kill previous instances first:
+## Shell hygiene
+When launching the daemon manually for testing, kill previous instances first:
 ```bash
 pkill -f samsung-scan-macos
 ```
