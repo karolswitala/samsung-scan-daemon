@@ -1,3 +1,4 @@
 *.exe
 /samsung-scan
 dist/
+*.log
