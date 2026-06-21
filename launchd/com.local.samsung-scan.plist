@@ -10,8 +10,6 @@
         <string>/usr/local/bin/samsung-scan</string>
         <string>--ip</string>
         <string>192.168.1.128</string>
-        <string>--output</string>
-        <string>/Users/karol/Desktop</string>
     </array>
     <key>RunAtLoad</key>
     <true/>

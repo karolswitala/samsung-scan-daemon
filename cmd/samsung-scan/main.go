@@ -15,6 +15,10 @@
 // directory. PDF is used when the user selects any PDF format on the printer;
 // JPEG is the fallback.
 //
+// When --output is omitted the daemon detects the currently active console user
+// at scan time (via /dev/console) and writes to /Users/{user}/Desktop. This
+// allows a single system daemon (running as root) to serve multiple user accounts.
+//
 // SIGINT and SIGTERM trigger a clean shutdown that deregisters this machine from
 // the printer before exiting.
 package main
@@ -26,7 +30,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -78,7 +84,8 @@ func setupLogger(level string) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: l})))
 }
 
-func run(ctx context.Context, ip, output string, pollInterval time.Duration) error {
+// outputFlag is "" when auto-detection is active, or an explicit path when --output is set.
+func run(ctx context.Context, ip, outputFlag string, pollInterval time.Duration) error {
 	profile := defaultProfile
 	uid := uniqueID()
 
@@ -147,8 +154,13 @@ func run(ctx context.Context, ip, output string, pollInterval time.Duration) err
 				resolution = 300
 			}
 
+			outDir := outputFlag
+			if outDir == "" {
+				outDir = activeUserDesktop()
+			}
+
 			actualFormat := sel.Format
-			if err := downloadAndSave(ip, output, resolution, actualFormat); err != nil {
+			if err := downloadAndSave(ip, outDir, resolution, actualFormat); err != nil {
 				slog.Error("download failed", "err", err)
 			}
 		}
@@ -197,13 +209,20 @@ func downloadAndSave(ip, output string, resolution int, format string) error {
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		return fmt.Errorf("write file: %w", err)
 	}
+	// When running as root, chown the file to match the output directory's owner
+	// so the user can manage the file in Finder without authenticating.
+	if info, err := os.Stat(output); err == nil {
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+			os.Chown(path, int(stat.Uid), int(stat.Gid))
+		}
+	}
 	slog.Info("scan saved", "path", path, "pages", len(pages), "format", ext, "bytes", len(data))
 	return nil
 }
 
 func main() {
 	ip := flag.String("ip", "", "Printer IP address (required)")
-	output := flag.String("output", expandHome("~/Desktop"), "Output directory for scanned files")
+	output := flag.String("output", "", "Output directory for scanned files (default: active user's Desktop)")
 	poll := flag.Duration("poll", 3*time.Second, "SNMP poll interval")
 	cleanup := flag.Bool("cleanup", false, "Deregister stale entries and exit")
 	logLevel := flag.String("log-level", "info", "Log level: debug/info/warn/error")
@@ -234,6 +253,36 @@ func main() {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
 	}
+}
+
+// consoleUser returns the username of the user currently logged in at the
+// Mac's display. Uses /dev/console, which reflects fast user switching correctly.
+func consoleUser() (string, error) {
+	out, err := exec.Command("stat", "-f", "%Su", "/dev/console").Output()
+	if err != nil {
+		return "", err
+	}
+	u := strings.TrimSpace(string(out))
+	if u == "" || u == "root" {
+		return "", fmt.Errorf("no interactive user at console")
+	}
+	return u, nil
+}
+
+// activeUserDesktop returns the Desktop path for the currently active console
+// user. Falls back to the daemon's own home directory if detection fails.
+func activeUserDesktop() string {
+	username, err := consoleUser()
+	if err != nil {
+		slog.Warn("console user detection failed, falling back to daemon home", "err", err)
+		return expandHome("~/Desktop")
+	}
+	u, err := user.Lookup(username)
+	if err != nil {
+		slog.Warn("user lookup failed", "user", username, "err", err)
+		return expandHome("~/Desktop")
+	}
+	return filepath.Join(u.HomeDir, "Desktop")
 }
 
 func expandHome(path string) string {

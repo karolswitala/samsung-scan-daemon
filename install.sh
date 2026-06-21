@@ -4,7 +4,7 @@ set -e
 BINARY=dist/samsung-scan-macos
 DEST=/usr/local/bin/samsung-scan
 PLIST=launchd/com.local.samsung-scan.plist
-PLIST_DEST="$HOME/Library/LaunchAgents/com.local.samsung-scan.plist"
+PLIST_DEST="/Library/LaunchDaemons/com.local.samsung-scan.plist"
 
 echo "Building..."
 make build-mac
@@ -18,7 +18,7 @@ cp "$PLIST" "$PLIST_DEST"
 
 echo ""
 echo "Edit $PLIST_DEST to set your printer IP, then run:"
-echo "  launchctl load $PLIST_DEST"
+echo "  sudo launchctl load $PLIST_DEST"
 echo ""
 echo "To view logs:  tail -f /tmp/samsung-scan.log"
-echo "To stop:       launchctl unload $PLIST_DEST"
+echo "To stop:       sudo launchctl unload $PLIST_DEST"
