@@ -240,17 +240,44 @@ tail -f ~/Library/Logs/samsung-scan.log
 # Build the image (~10 MB, FROM scratch)
 make docker
 
-# Run with a mounted output directory
+# Run with a named volume for scan output
 docker run --rm \
-  -v /tmp/scans:/scans \
+  -v samsung-scans:/scans \
   samsung-scan:latest \
   --ip 192.168.1.128 \
   --output /scans \
   --log-level info
 ```
 
+The `samsung-scans` volume is created automatically on the first run. The image
+pre-creates `/scans` owned by UID 65534 (nobody), so no `--user` flag or manual
+volume setup is needed.
+
+To retrieve scans from the volume:
+
+```bash
+# List files
+docker run --rm -v samsung-scans:/scans alpine ls /scans
+
+# Copy to current directory
+docker run --rm -v samsung-scans:/scans -v "$PWD":/out alpine \
+  sh -c "cp /scans/* /out/"
+```
+
+If you prefer a host bind mount instead, add `--user $(id -u):$(id -g)` so the
+container runs as your host user and can write to the directory:
+
+```bash
+docker run --rm \
+  -v /tmp/scans:/scans \
+  --user $(id -u):$(id -g) \
+  samsung-scan:latest \
+  --ip 192.168.1.128 \
+  --output /scans
+```
+
 The final image is built `FROM scratch` with a fully static binary — no OS
-layer, no shell, no libc.
+layer, no shell, no libc. The process runs as UID 65534 (nobody), not root.
 
 ---
 
