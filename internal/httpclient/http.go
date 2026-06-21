@@ -157,8 +157,22 @@ func Deregister(ip, userID, uniqueID string) error {
 		`<?xml version="1.0" encoding="utf-8"?><root><S2PC_Regi RegiType="DELETE" UserID="%s" UniqueID="%s" /></root>`,
 		userID, uniqueID,
 	)
-	_, err := post(ip, xmlBody, 10*time.Second)
-	return err
+	data, err := post(ip, xmlBody, 10*time.Second)
+	if err != nil {
+		return err
+	}
+	var root struct {
+		Regi struct {
+			Result string `xml:"Result,attr"`
+		} `xml:"S2PC_Regi"`
+	}
+	if err := xml.Unmarshal(data, &root); err != nil {
+		return nil // unparseable response — treat as success (e.g. first run, no entry)
+	}
+	if root.Regi.Result != "" && root.Regi.Result != "DELETE_OK" {
+		return fmt.Errorf("DELETE result: %s", root.Regi.Result)
+	}
+	return nil
 }
 
 // PostAppList announces a scan profile so this machine appears as "Available" on the LCD.

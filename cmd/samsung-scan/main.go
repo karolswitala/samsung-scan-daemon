@@ -91,7 +91,7 @@ func run(ctx context.Context, ip, outputFlag string, pollInterval time.Duration)
 
 	// Clean up stale registration from a previous run
 	if err := httpclient.Deregister(ip, userID, uid); err != nil {
-		slog.Debug("deregister at startup (expected if first run)", "err", err)
+		slog.Warn("startup deregister failed — stale entry with different UniqueID? Use --cleanup or curl to remove it manually", "err", err)
 	}
 
 	instanceID, err := httpclient.Register(ip, userID, uid)
