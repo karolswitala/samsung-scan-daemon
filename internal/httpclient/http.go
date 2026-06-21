@@ -61,6 +61,35 @@ type Selection struct {
 	Size       string
 }
 
+// xmlDecl is prepended to every marshalled XML body sent to the printer.
+const xmlDecl = `<?xml version="1.0" encoding="utf-8"?>`
+
+// xmlStr / xmlInt are single-attribute wrapper elements used in AppList XML.
+type xmlStr struct{ Value string `xml:"Value,attr"` }
+type xmlInt struct{ Value int    `xml:"Value,attr"` }
+
+type regiRequest struct {
+	XMLName xml.Name `xml:"root"`
+	Regi    struct {
+		RegiType string `xml:"RegiType,attr"`
+		UserID   string `xml:"UserID,attr"`
+		UniqueID string `xml:"UniqueID,attr"`
+	} `xml:"S2PC_Regi"`
+}
+
+type appListRequest struct {
+	XMLName xml.Name `xml:"root"`
+	List    struct {
+		AppIndex   xmlInt `xml:"AppIndex"`
+		AppName    xmlStr `xml:"AppName"`
+		AppType    xmlStr `xml:"AppType"`
+		ScanSize   xmlStr `xml:"ScanSize"`
+		FileFormat xmlStr `xml:"FileFormat"`
+		Color      xmlStr `xml:"Color"`
+		Resolution xmlStr `xml:"Resolution"`
+	} `xml:"S2PC_AppList>List"`
+}
+
 // client is a shared http.Client with the EPM User-Agent injected on every request.
 var client = &http.Client{
 	Transport: &epmTransport{http.DefaultTransport},
@@ -127,11 +156,12 @@ func get(ip, path string, timeout time.Duration) ([]byte, error) {
 
 // Register creates a Scan-to-PC slot and returns the InstanceID assigned by the printer.
 func Register(ip, userID, uniqueID string) (int, error) {
-	xmlBody := fmt.Sprintf(
-		`<?xml version="1.0" encoding="utf-8"?><root><S2PC_Regi RegiType="ADD" UserID="%s" UniqueID="%s" /></root>`,
-		userID, uniqueID,
-	)
-	data, err := post(ip, xmlBody, 10*time.Second)
+	var req regiRequest
+	req.Regi.RegiType = "ADD"
+	req.Regi.UserID = userID
+	req.Regi.UniqueID = uniqueID
+	payload, _ := xml.Marshal(req)
+	data, err := post(ip, xmlDecl+string(payload), 10*time.Second)
 	if err != nil {
 		return 0, fmt.Errorf("register POST: %w", err)
 	}
@@ -153,11 +183,12 @@ func Register(ip, userID, uniqueID string) (int, error) {
 
 // Deregister removes this machine from the printer's Scan-to-PC list.
 func Deregister(ip, userID, uniqueID string) error {
-	xmlBody := fmt.Sprintf(
-		`<?xml version="1.0" encoding="utf-8"?><root><S2PC_Regi RegiType="DELETE" UserID="%s" UniqueID="%s" /></root>`,
-		userID, uniqueID,
-	)
-	data, err := post(ip, xmlBody, 10*time.Second)
+	var req regiRequest
+	req.Regi.RegiType = "DELETE"
+	req.Regi.UserID = userID
+	req.Regi.UniqueID = uniqueID
+	payload, _ := xml.Marshal(req)
+	data, err := post(ip, xmlDecl+string(payload), 10*time.Second)
 	if err != nil {
 		return err
 	}
@@ -178,20 +209,16 @@ func Deregister(ip, userID, uniqueID string) error {
 // PostAppList announces a scan profile so this machine appears as "Available" on the LCD.
 // The printer never sends an HTTP response to this request — all errors are swallowed.
 func PostAppList(ip string, appIndex int, p Profile) {
-	xmlBody := fmt.Sprintf(
-		`<?xml version="1.0" encoding="utf-8"`+
-			`?><root><S2PC_AppList><List>`+
-			`<AppIndex Value="%d" />`+
-			`<AppName Value="My Mac" />`+
-			`<AppType Value="MAC" />`+
-			`<ScanSize Value="%s" />`+
-			`<FileFormat Value="%s" />`+
-			`<Color Value="%s" />`+
-			`<Resolution Value="%s" />`+
-			`</List></S2PC_AppList></root>`,
-		appIndex, p.Size, p.Format, p.Color, p.Resolution,
-	)
-	body, ct := buildMultipart(xmlBody)
+	var al appListRequest
+	al.List.AppIndex.Value = appIndex
+	al.List.AppName.Value = "My Mac"
+	al.List.AppType.Value = "MAC"
+	al.List.ScanSize.Value = p.Size
+	al.List.FileFormat.Value = p.Format
+	al.List.Color.Value = p.Color
+	al.List.Resolution.Value = p.Resolution
+	payload, _ := xml.Marshal(al)
+	body, ct := buildMultipart(xmlDecl + string(payload))
 	req, err := http.NewRequest("POST", "http://"+ip+scanPath, body)
 	if err != nil {
 		return
