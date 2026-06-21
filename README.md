@@ -17,14 +17,15 @@ Idle memory footprint: ~8 MB RSS. Static binary, no runtime dependencies.
 3. [Quick start](#quick-start)
 4. [Building](#building)
 5. [Installing on macOS (launchd)](#installing-on-macos-launchd)
-6. [Running in Docker](#running-in-docker)
-7. [Flags](#flags)
-8. [How scanning works](#how-scanning-works)
-9. [Output formats](#output-formats)
-10. [Multi-page ADF scans](#multi-page-adf-scans)
-11. [Development](#development)
-12. [Troubleshooting](#troubleshooting)
-13. [Protocol reference](#protocol-reference)
+6. [Multi-user and fast user switching](#multi-user-and-fast-user-switching)
+7. [Running in Docker](#running-in-docker)
+8. [Flags](#flags)
+9. [How scanning works](#how-scanning-works)
+10. [Output formats](#output-formats)
+11. [Multi-page ADF scans](#multi-page-adf-scans)
+12. [Development](#development)
+13. [Troubleshooting](#troubleshooting)
+14. [Protocol reference](#protocol-reference)
 
 ---
 
@@ -130,44 +131,100 @@ GO=/opt/homebrew/bin/go make build-mac
 
 ## Installing on macOS (launchd)
 
-The daemon runs as a user LaunchAgent — it starts at login and restarts
-automatically if it crashes.
+The daemon runs as a **per-user LaunchAgent** — it starts at login inside
+your GUI session and restarts automatically if it crashes. It runs as you
+(not root) and writes scans directly to your Desktop.
 
 ### One-step install
 
-```bash
-./install.sh
-```
-
-This builds the binary, copies it to `/usr/local/bin/samsung-scan`, and
-installs the plist under `~/Library/LaunchAgents/`. Then edit the plist to
-set your printer IP and output directory:
+Run as your normal (non-root) user:
 
 ```bash
-$EDITOR ~/Library/LaunchAgents/com.local.samsung-scan.plist
+./install.sh                   # prompts for printer IP (default 192.168.1.128)
+./install.sh 192.168.1.50     # or pass it directly
 ```
 
-Change `192.168.1.128` and `/Users/karol/Desktop` to your values.
+This builds the binary, copies it to `/usr/local/bin/samsung-scan` (requires
+`sudo` for that one copy), installs the plist under `~/Library/LaunchAgents/`
+with your printer IP and home directory already substituted, and **loads the
+agent immediately**. Scans go to your Desktop automatically.
 
-### Load / unload
+Re-running `./install.sh` with a new IP is safe — it unloads the old agent
+before reloading.
+
+### Load / unload / reload
 
 ```bash
-# Start the agent (also happens automatically at next login)
-launchctl load ~/Library/LaunchAgents/com.local.samsung-scan.plist
+# Stop
+launchctl bootout "gui/$(id -u)/com.local.samsung-scan"
 
-# Stop the agent
-launchctl unload ~/Library/LaunchAgents/com.local.samsung-scan.plist
+# Start (also happens automatically at next login)
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.local.samsung-scan.plist
 
-# View merged stdout/stderr log
-tail -f /tmp/samsung-scan.log
+# View logs
+tail -f ~/Library/Logs/samsung-scan.log
 ```
+
+### Upgrading from the old root LaunchDaemon
+
+If you previously installed the system-wide root daemon, remove it first:
+
+```bash
+sudo launchctl unload /Library/LaunchDaemons/com.local.samsung-scan.plist
+sudo rm /Library/LaunchDaemons/com.local.samsung-scan.plist
+```
+
+Then run `./install.sh` as your normal user.
 
 ### Uninstall
 
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.local.samsung-scan.plist
+launchctl bootout gui/$(id -u)/com.local.samsung-scan
 rm ~/Library/LaunchAgents/com.local.samsung-scan.plist
 sudo rm /usr/local/bin/samsung-scan
+```
+
+---
+
+## Multi-user and fast user switching
+
+Each macOS account that needs to scan runs `./install.sh` as themselves —
+that's the only difference from a single-user setup. launchd then runs one
+agent per logged-in user, each as that user, each writing to their own Desktop.
+
+The script skips the build and binary copy if `/usr/local/bin/samsung-scan`
+already exists, so the second user doesn't need sudo or Go installed.
+
+### How active-user gating works
+
+All agents share the same printer identity (`userID = "My Mac"`, `uniqueID`
+derived from the machine hostname), so the printer LCD always shows exactly one
+"My Mac" target regardless of how many users are logged in.
+
+On every poll tick each agent checks whether it owns `/dev/console` — macOS
+assigns that device to the foreground console user and updates it on every
+fast-user switch. Only the active user's agent registers with the printer:
+
+```
+User A is active:   agent-A registered and serving
+                    agent-B idle
+
+Switch to user B:   agent-A deregisters
+                    agent-B registers and starts serving
+```
+
+Scans always land on the active user's Desktop. During the switch itself there
+is a brief window (up to one poll tick, default 3 s) where neither agent is
+registered; a scan triggered at that exact moment will be missed.
+
+### Verifying
+
+```bash
+# Agent is running as you, not root:
+ps -o user= -p "$(pgrep -f samsung-scan)"
+
+# Each user's log is separate:
+tail -f ~/Library/Logs/samsung-scan.log
 ```
 
 ---
@@ -403,20 +460,28 @@ of the relevant machine's hostname).
 
 ### Two daemon instances running simultaneously
 
-Always kill the previous instance before launching a new one:
+When running manually (not via launchd), kill the previous instance first:
 
 ```bash
 pkill -f samsung-scan-macos || true
 ./dist/samsung-scan-macos --ip 192.168.1.128 ...
 ```
 
-Two instances share the same registration and cause `DUPLICATE_USER` errors.
+Two instances with the same identity cause `DUPLICATE_USER` errors on the
+next registration attempt. When running as a LaunchAgent this is handled
+automatically — launchd runs exactly one agent per user.
 
 ### Download fails or produces a corrupt/empty file
 
 Run with `--log-level debug` and scan again. Look for error lines. Common
 causes: 30-second TCP deadline exceeded (very large scan at high DPI), or a
 network interruption between chunks.
+
+Logs are at `~/Library/Logs/samsung-scan.log` when running as a LaunchAgent:
+
+```bash
+tail -f ~/Library/Logs/samsung-scan.log
+```
 
 ---
 
