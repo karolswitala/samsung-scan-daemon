@@ -10,7 +10,7 @@ make build-mac                         # → dist/samsung-scan-macos (ARM64)
 make build-linux                       # → dist/samsung-scan-linux (AMD64, static)
 make test                              # unit tests across all packages
 ./dist/samsung-scan-macos --ip <printer-ip> --log-level debug
-# Flags: --ip (required), --output, --poll, --cleanup, --log-level
+# Flags: --ip (required), --output, --poll, --cleanup, --log-level, --enable-network-guard
 # Resolution/color/format are NOT CLI flags — they come from the printer (GetUserSelect)
 ```
 
@@ -42,6 +42,21 @@ After the POLL/FETCH image download, the client sends PARAMS and loops until the
 responds with `status[1] == 0x04` ("no more pages"). The printer sends intermediate
 `0x08` responses while the ADF feeds the next page. Breaking early on any non-`0x04`
 byte causes the connection to desync.
+
+### 3. Active-user gating via /dev/console
+The daemon runs as a per-user LaunchAgent (not root). Under fast user switching,
+multiple instances may run simultaneously. Only the foreground console user should
+register with the printer. `isActiveConsoleUser()` in `cmd/samsung-scan/main.go`
+reads `os.Stat("/dev/console")` and checks `Stat_t.Uid == os.Getuid()` — macOS
+updates the owner of /dev/console on every user switch. If this check fails
+(e.g. testing outside a GUI session), the daemon stays idle and will not register.
+
+### 4. --enable-network-guard is macOS-only
+When `--enable-network-guard <mac>` is set, the daemon calls `/usr/sbin/arp -n <ip>`
+before each registration attempt. On Linux (e.g. Docker scratch), `/usr/sbin/arp`
+does not exist; `exec.LookPath` fails at startup, the guard is disabled with a single
+Info log, and the daemon proceeds normally. Do not expect the flag to have any effect
+in non-macOS builds.
 
 ## Architecture
 ```
