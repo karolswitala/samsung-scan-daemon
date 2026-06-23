@@ -19,6 +19,17 @@ else
     PRINTER_IP="${PRINTER_IP:-$DEFAULT_IP}"
 fi
 
+# Prompt for output directory (relative to home folder; Enter = Desktop)
+read -rp "Output directory relative to home [Desktop]: " OUTPUT_SUBDIR
+if [ -n "$OUTPUT_SUBDIR" ]; then
+    OUTPUT_SUBDIR="${OUTPUT_SUBDIR#/}"   # strip any accidental leading slash
+    OUTPUT_DIR="$HOME/$OUTPUT_SUBDIR"
+    mkdir -p "$OUTPUT_DIR"
+    echo "Output directory: $OUTPUT_DIR"
+else
+    OUTPUT_DIR=""
+fi
+
 # Accept MAC as second argument, otherwise auto-discover via ARP (no sudo needed)
 if [ -n "$2" ]; then
     PRINTER_MAC="$2"
@@ -46,6 +57,12 @@ cp "$PLIST" "$PLIST_DEST"
 sed -i '' "s|__HOME__|$HOME|g" "$PLIST_DEST"
 sed -i '' "s|192.168.1.128|$PRINTER_IP|g" "$PLIST_DEST"
 
+# Inject output directory into plist if specified
+if [ -n "$OUTPUT_DIR" ]; then
+    /usr/libexec/PlistBuddy -c "Add :ProgramArguments: string --output" "$PLIST_DEST"
+    /usr/libexec/PlistBuddy -c "Add :ProgramArguments: string $OUTPUT_DIR" "$PLIST_DEST"
+fi
+
 # Inject network guard MAC into plist if discovered (macOS-only; skipped automatically on Linux/Docker)
 if [ -n "$PRINTER_MAC" ]; then
     /usr/libexec/PlistBuddy -c "Add :ProgramArguments: string --enable-network-guard" "$PLIST_DEST"
@@ -62,6 +79,8 @@ launchctl bootout "gui/$(id -u)/com.local.samsung-scan" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST_DEST"
 
 echo ""
-echo "Agent loaded. Printer IP: $PRINTER_IP"
-echo "To view logs:  tail -f ~/Library/Logs/samsung-scan.log"
-echo "To stop:       launchctl bootout gui/\$(id -u)/com.local.samsung-scan"
+echo "Agent loaded."
+echo "Printer IP:       $PRINTER_IP"
+echo "Output:           ${OUTPUT_DIR:-~/Desktop (default)}"
+echo "To view logs:     tail -f ~/Library/Logs/samsung-scan.log"
+echo "To stop:          launchctl bootout gui/\$(id -u)/com.local.samsung-scan"
