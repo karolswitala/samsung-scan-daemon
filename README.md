@@ -134,7 +134,7 @@ GO=/opt/homebrew/bin/go make build-mac
 
 The daemon runs as a **per-user LaunchAgent** — it starts at login inside
 your GUI session and restarts automatically if it crashes. It runs as you
-(not root) and writes scans directly to your Desktop.
+(not root) and writes scans to a folder of your choice.
 
 ### One-step install
 
@@ -146,16 +146,30 @@ Run as your normal (non-root) user:
 ./install.sh 192.168.1.50 30:cd:a7:b8:c7:e9   # pass IP + known MAC (skips ARP probe)
 ```
 
+The script prompts for two things:
+
+1. **Printer IP** — default `192.168.1.128`, or pass as `$1`.
+2. **Output directory** — relative to your home folder. Press Enter to keep the
+   default (`~/Desktop`), or type a path such as `Documents/Scans`:
+
+   ```
+   Output directory relative to home [Desktop]: Documents/Scans
+   Output directory: /Users/karol/Documents/Scans
+   ```
+
+   The directory is created automatically. A leading `/` is stripped if present,
+   so both `Documents/Scans` and `/Documents/Scans` work.
+
 This builds the binary, copies it to `/usr/local/bin/samsung-scan` (requires
 `sudo` for that one copy), installs the plist under `~/Library/LaunchAgents/`
-with your printer IP and home directory already substituted, and **loads the
-agent immediately**. Scans go to your Desktop automatically.
+with your printer IP, output path, and home directory already substituted, and
+**loads the agent immediately**.
 
 If the printer is reachable at install time, `install.sh` auto-discovers its
 MAC via ARP and enables the network guard — see [Network guard](#network-guard).
 
-Re-running `./install.sh` with a new IP is safe — it unloads the old agent
-before reloading.
+Re-running `./install.sh` is safe — it unloads the old agent before reloading,
+so you can use it to change the IP or output folder at any time.
 
 ### Load / unload / reload
 
