@@ -1,4 +1,4 @@
-GO     = /usr/local/go/bin/go
+GO     ?= go
 BINARY = samsung-scan
 MODULE = ./cmd/samsung-scan
 LDFLAGS = -ldflags="-s -w"
