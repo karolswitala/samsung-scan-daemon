@@ -6,6 +6,9 @@ DEST=/usr/local/bin/samsung-scan
 PLIST=launchd/com.local.samsung-scan.plist
 PLIST_DEST="$HOME/Library/LaunchAgents/com.local.samsung-scan.plist"
 DEFAULT_IP="192.168.1.128"
+GITHUB_REPO="karol/samsung-scan"
+RELEASE_URL="https://github.com/${GITHUB_REPO}/releases/latest/download/samsung-scan-macos"
+TMP_BINARY=/tmp/samsung-scan-download
 
 # If upgrading from the old root LaunchDaemon, remove it first:
 #   sudo launchctl unload /Library/LaunchDaemons/com.local.samsung-scan.plist
@@ -39,16 +42,26 @@ else
     PRINTER_MAC=$(echo "$ARP_OUT" | awk '{for(i=1;i<=NF;i++) if($i=="at") {print $(i+1); exit}}')
 fi
 
-# Build and install the binary only if it is not already present.
+# Install the binary only if it is not already present.
 # On a multi-user Mac the first user installs it; subsequent users skip this.
 if [ ! -f "$DEST" ]; then
-    echo "Building..."
-    make build-mac
-    echo "Installing binary to $DEST"
-    sudo mkdir -p "$(dirname "$DEST")"
-    sudo cp "$BINARY" "$DEST"
+    if curl -fsSL "$RELEASE_URL" -o "$TMP_BINARY" 2>/dev/null; then
+        echo "Downloaded pre-built binary from GitHub Releases"
+        chmod +x "$TMP_BINARY"
+        sudo mkdir -p "$(dirname "$DEST")"
+        sudo install -m 755 "$TMP_BINARY" "$DEST"
+        rm -f "$TMP_BINARY"
+    else
+        echo "No pre-built release found — building from source (Go required)."
+        echo "If Go is not installed, download the binary from:"
+        echo "  https://github.com/${GITHUB_REPO}/releases"
+        make build-mac
+        echo "Installing binary to $DEST"
+        sudo mkdir -p "$(dirname "$DEST")"
+        sudo cp "$BINARY" "$DEST"
+    fi
 else
-    echo "Binary already installed at $DEST — skipping build"
+    echo "Binary already installed at $DEST — skipping"
 fi
 
 echo "Installing LaunchAgent plist to $PLIST_DEST"

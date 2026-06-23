@@ -15,7 +15,7 @@ Idle memory footprint: ~8 MB RSS. Static binary, no runtime dependencies.
 1. [Architecture](#architecture)
 2. [Requirements](#requirements)
 3. [Quick start](#quick-start)
-4. [Building](#building)
+4. [Building from source](#building-from-source)
 5. [Installing on macOS (launchd)](#installing-on-macos-launchd)
 6. [Multi-user and fast user switching](#multi-user-and-fast-user-switching)
 7. [Running in Docker](#running-in-docker)
@@ -87,16 +87,29 @@ Idle memory footprint: ~8 MB RSS. Static binary, no runtime dependencies.
 
 ## Requirements
 
-- **Go 1.23+** (`brew install go` or [go.dev/dl](https://go.dev/dl))
 - Samsung M2070W printer reachable on the local network
 - macOS for the launchd path; any Linux host or Docker for the container path
+- **Go 1.23+** only if building from source (`brew install go` or [go.dev/dl](https://go.dev/dl))
 
 ---
 
 ## Quick start
 
+### Install from a pre-built release (no Go required)
+
 ```bash
-# Build for macOS M-series
+git clone https://github.com/karol/samsung-scan.git
+cd samsung-scan
+./install.sh                   # prompts for printer IP; downloads binary automatically
+```
+
+`install.sh` fetches the latest release binary from GitHub, copies it to
+`/usr/local/bin/samsung-scan`, installs the LaunchAgent, and loads it — all in one step.
+See [Installing on macOS (launchd)](#installing-on-macos-launchd) for options.
+
+### Run directly from source
+
+```bash
 make build-mac
 
 # Kill any previous instance first (important — see Troubleshooting)
@@ -111,7 +124,7 @@ pkill -f samsung-scan-macos || true
 
 ---
 
-## Building
+## Building from source
 
 ```bash
 make build-mac      # dist/samsung-scan-macos  (darwin/arm64)

@@ -71,19 +71,22 @@ placement**, not from the wire parsing.
 
 ## Findings
 
-| ID | Title | Severity | Location |
-|----|-------|----------|----------|
-| H1 | Network/image/PDF stack runs as root, no privilege drop | High | `launchd/com.local.samsung-scan.plist`, `internal/imageutil/assemble.go:49,79` |
-| H2 | Root log path in world-writable `/tmp` (symlink redirection) | High | `launchd/com.local.samsung-scan.plist` |
-| M2 | Console-user detection shells out to `stat` via PATH | Medium | `cmd/samsung-scan/main.go:261` |
-| M3 | Root write into user-owned directory with TOCTOU window | Medium | `cmd/samsung-scan/main.go:208-218` |
-| L1 | Unbounded allocation from printer-supplied data (DoS) | Low | `internal/tcp/tcp.go:143,350,387`; `internal/imageutil/assemble.go:54,58` |
-| L2 | XML built with `fmt.Sprintf`, no escaping | Low | `internal/httpclient/http.go:130,156,181` |
-| L3 | `*.log` not gitignored; real log present in tree | Low | `.gitignore`, `log_1633_20062026.log` |
-| L4 | Plaintext, unauthenticated protocols | Low (accepted) | `internal/snmp/snmp.go:29` |
-| I1 | Docker image runs as root, no `USER` | Info | `Dockerfile` |
-| I2 | `uniqueID` uses MD5 (non-crypto identifier) | Info | `cmd/samsung-scan/main.go:68` |
-| I3 | Positive controls observed | Info | multiple |
+> **All actionable findings resolved as of 2026-06-23.** The table below reflects
+> the original audit state; the **Status** column shows current disposition.
+
+| ID | Title | Severity | Location | Status |
+|----|-------|----------|----------|--------|
+| H1 | Network/image/PDF stack runs as root, no privilege drop | High | `launchd/com.local.samsung-scan.plist`, `internal/imageutil/assemble.go:49,79` | ✅ Resolved — per-user LaunchAgent (`plist:8`) |
+| H2 | Root log path in world-writable `/tmp` (symlink redirection) | High | `launchd/com.local.samsung-scan.plist` | ✅ Resolved — `~/Library/Logs/samsung-scan.log` (`plist:23`) |
+| M2 | Console-user detection shells out to `stat` via PATH | Medium | `cmd/samsung-scan/main.go:261` | ✅ Resolved — in-process `os.Stat("/dev/console")` (`main.go:312`) |
+| M3 | Root write into user-owned directory with TOCTOU window | Medium | `cmd/samsung-scan/main.go:208-218` | ✅ Resolved — eliminated by per-user agent |
+| L1 | Unbounded allocation from printer-supplied data (DoS) | Low | `internal/tcp/tcp.go:143,350,387`; `internal/imageutil/assemble.go:54,58` | ✅ Resolved — caps in `tcp.go:91-95`, `imageutil` |
+| L2 | XML built with `fmt.Sprintf`, no escaping | Low | `internal/httpclient/http.go:130,156,181` | ✅ Resolved — `xml.Marshal` (`http.go:163,190,220`) |
+| L3 | `*.log` not gitignored; real log present in tree | Low | `.gitignore`, `log_1633_20062026.log` | ✅ Resolved — `*.log` in `.gitignore`, no stray log in tree |
+| L4 | Plaintext, unauthenticated protocols | Low (accepted) | `internal/snmp/snmp.go:29` | Accepted by design (trusted-LAN model) |
+| I1 | Docker image runs as root, no `USER` | Info | `Dockerfile` | ✅ Resolved — non-root `nobody` UID |
+| I2 | `uniqueID` uses MD5 (non-crypto identifier) | Info | `cmd/samsung-scan/main.go:68` | Accepted — non-security identifier |
+| I3 | Positive controls observed | Info | multiple | — |
 
 A step-by-step implementation of the recommendations is in `REMEDIATION_PLAN.md`.
 

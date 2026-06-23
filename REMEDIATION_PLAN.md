@@ -35,7 +35,7 @@ priority.
 
 ---
 
-## Phase 1 — Per-user LaunchAgent with active-console-user gating (H1, M2, M3)
+## Phase 1 ✅ — Per-user LaunchAgent with active-console-user gating (H1, M2, M3)
 
 **Goal:** the daemon runs **as the logged-in user, inside their GUI session**, never
 as root; and when several users are logged in, only the foreground user's instance
@@ -153,7 +153,7 @@ there is exactly one printer slot.
 
 ---
 
-## Phase 2 — Move logs off `/tmp` (H2)
+## Phase 2 ✅ — Move logs off `/tmp` (H2)
 
 After Phase 1 the daemon is non-root, which already removes the symlink-redirection
 primitive. Finish by writing to a user-owned, non-shared location.
@@ -172,7 +172,7 @@ primitive. Finish by writing to a user-owned, non-shared location.
 
 ---
 
-## Phase 3 — Allocation caps against a hostile responder (L1)
+## Phase 3 ✅ — Allocation caps against a hostile responder (L1)
 
 These caps defend the parsing stack regardless of network trust (relevant to the
 public-WiFi / IP-collision scenario in the audit Appendix). Choose limits well
@@ -201,7 +201,7 @@ have `_test.go` harnesses to extend. `make test` stays green.
 
 ---
 
-## Phase 4 — Hygiene (L3)
+## Phase 4 ✅ — Hygiene (L3)
 
 - Add `*.log` to `.gitignore`.
 - Remove the stray `log_1633_20062026.log` from the working tree.
@@ -209,7 +209,7 @@ have `_test.go` harnesses to extend. `make test` stays green.
 
 ---
 
-## Phase 5 — Optional hardening (L2, L4, I1, network guard)
+## Phase 5 (ongoing) — Optional hardening (L2, L4, I1, network guard)
 
 Do these as convenient; none block the single-user deployment.
 

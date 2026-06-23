@@ -3,7 +3,7 @@ BINARY = samsung-scan
 MODULE = ./cmd/samsung-scan
 LDFLAGS = -ldflags="-s -w"
 
-.PHONY: build-mac build-linux test lint docker clean
+.PHONY: build-mac build-linux test test-race lint docker clean
 
 build-mac:
 	mkdir -p dist
@@ -15,6 +15,9 @@ build-linux:
 
 test:
 	$(GO) test ./... -v
+
+test-race:
+	$(GO) test -race ./...
 
 lint:
 	$(GO) vet ./...
