@@ -22,6 +22,8 @@ import (
 
 type fakeHTTP struct {
 	registerReturn  int
+	registerReturns []int // optional per-call sequence; falls back to registerReturn
+	registerCalls   int
 	registerErr     error
 	deregisterCalls int
 	appListCalls    []int // appIndex values
@@ -29,7 +31,18 @@ type fakeHTTP struct {
 }
 
 func (f *fakeHTTP) Register(ip, userID, uid string) (int, error) {
-	return f.registerReturn, f.registerErr
+	f.registerCalls++
+	if f.registerErr != nil {
+		return 0, f.registerErr
+	}
+	if len(f.registerReturns) > 0 {
+		i := f.registerCalls - 1
+		if i >= len(f.registerReturns) {
+			i = len(f.registerReturns) - 1
+		}
+		return f.registerReturns[i], nil
+	}
+	return f.registerReturn, nil
 }
 func (f *fakeHTTP) Deregister(ip, userID, uid string) error {
 	f.deregisterCalls++
@@ -43,17 +56,24 @@ func (f *fakeHTTP) GetUserSelect(ip string) (httpclient.Selection, error) {
 }
 
 type fakeSNMP struct {
-	states []snmp.State
-	pos    int
+	states     []snmp.State
+	errs       []error // parallel to states; nil means success
+	pos        int
+	polledWith []int // instanceID seen on each Poll call
 }
 
 func (f *fakeSNMP) Poll(ip string, instanceID int, timeout time.Duration) (snmp.State, error) {
+	f.polledWith = append(f.polledWith, instanceID)
 	if f.pos >= len(f.states) {
 		return snmp.Idle, nil
 	}
 	s := f.states[f.pos]
+	var err error
+	if f.pos < len(f.errs) {
+		err = f.errs[f.pos]
+	}
 	f.pos++
-	return s, nil
+	return s, err
 }
 
 type fakeTCP struct {
@@ -112,6 +132,7 @@ func runWithDeps(ctx context.Context, ip, output string, profile httpclient.Prof
 	defer d.http.Deregister(ip, userID, uid)
 
 	lastState := snmp.Idle
+	consecutiveFailures := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -119,7 +140,25 @@ func runWithDeps(ctx context.Context, ip, output string, profile httpclient.Prof
 		default:
 		}
 
-		state, _ := d.snmp.Poll(ip, instanceID, 2*time.Second)
+		state, err := d.snmp.Poll(ip, instanceID, 2*time.Second)
+		if err != nil {
+			consecutiveFailures++
+			if consecutiveFailures >= reRegisterAfterFailures {
+				d.http.Deregister(ip, userID, uid)
+				if newID, rerr := d.http.Register(ip, userID, uid); rerr == nil {
+					instanceID = newID
+					lastState = snmp.Idle
+					consecutiveFailures = 0
+				}
+			}
+			if _, ok := ctx.Deadline(); !ok {
+				if f, ok := d.snmp.(*fakeSNMP); ok && f.pos >= len(f.states) {
+					return nil
+				}
+			}
+			continue
+		}
+		consecutiveFailures = 0
 
 		if state == snmp.Triggered && lastState != snmp.Triggered {
 			d.http.PostAppList(ip, appIndex, profile)
@@ -360,6 +399,34 @@ func TestCleanupCalledAtStartup(t *testing.T) {
 	// deregister called at startup (cleanup) + defer at shutdown = ≥2
 	if fh.deregisterCalls < 2 {
 		t.Errorf("expected deregister at startup+shutdown, got %d calls", fh.deregisterCalls)
+	}
+}
+
+func TestReRegistersAfterOutage(t *testing.T) {
+	tmp := t.TempDir()
+	// First Register returns 3 (startup); the recovery Register returns 7.
+	fh := &fakeHTTP{registerReturns: []int{3, 7}, userSelectRet: makeActiveSelection()}
+	// 3 failing polls (printer offline) then an idle success (recovered).
+	fs := &fakeSNMP{
+		states: []snmp.State{snmp.Idle, snmp.Idle, snmp.Idle, snmp.Idle},
+		errs:   []error{snmp.ErrNoResponse, snmp.ErrNoResponse, snmp.ErrNoResponse, nil},
+	}
+	ft := &fakeTCP{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := runWithDeps(ctx, "192.168.1.128", tmp, httpclient.Profile{}, deps{fh, fs, ft}); err != nil {
+		t.Fatal(err)
+	}
+
+	if fh.registerCalls != 2 {
+		t.Errorf("expected re-registration (2 Register calls), got %d", fh.registerCalls)
+	}
+	// After recovery, subsequent polls must use the new instanceID (7), not 3.
+	last := fs.polledWith[len(fs.polledWith)-1]
+	if last != 7 {
+		t.Errorf("expected polling with new instanceID 7 after re-register, got %d", last)
 	}
 }
 

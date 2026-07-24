@@ -147,7 +147,10 @@ set your printer IP and output directory:
 $EDITOR ~/Library/LaunchAgents/com.local.samsung-scan.plist
 ```
 
-Change `192.168.1.128` and `/Users/karol/Desktop` to your values.
+Change `192.168.1.128` to your printer's IP. `install.sh` also expands the
+`__HOME__` placeholder in the plist's log paths to your home directory (launchd
+does not expand `~`); if you install the plist by hand instead of running
+`install.sh`, replace `__HOME__` with your home path yourself.
 
 ### Load / unload
 
@@ -159,7 +162,7 @@ launchctl load ~/Library/LaunchAgents/com.local.samsung-scan.plist
 launchctl unload ~/Library/LaunchAgents/com.local.samsung-scan.plist
 
 # View merged stdout/stderr log
-tail -f /tmp/samsung-scan.log
+tail -f ~/Library/Logs/samsung-scan.log
 ```
 
 ### Uninstall

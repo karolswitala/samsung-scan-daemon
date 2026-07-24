@@ -15,9 +15,13 @@
 // directory. PDF is used when the user selects any PDF format on the printer;
 // JPEG is the fallback.
 //
-// When --output is omitted the daemon detects the currently active console user
-// at scan time (via /dev/console) and writes to /Users/{user}/Desktop. This
-// allows a single system daemon (running as root) to serve multiple user accounts.
+// The daemon runs as a per-user LaunchAgent — one instance per logged-in user,
+// running as that user. When --output is omitted it writes to the running user's
+// own ~/Desktop.
+//
+// If the printer is power-cycled while the daemon runs, it drops the in-memory
+// Scan2PC registration. The poll loop detects the printer no longer answering for
+// our OID and automatically re-registers when it becomes reachable again.
 //
 // SIGINT and SIGTERM trigger a clean shutdown that deregisters this machine from
 // the printer before exiting.
@@ -30,9 +34,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"os/signal"
-	"os/user"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -47,6 +49,11 @@ import (
 const (
 	userID   = "My Mac"
 	appIndex = 1 // AppList profile slot; must be ≤ MaxUser (10). Independent of S2PC_Regi InstanceID.
+
+	// reRegisterAfterFailures is how many consecutive polls with no usable
+	// response we tolerate before assuming the printer was power-cycled (or went
+	// offline) and re-registering. At the default 3s poll interval this is ~9s.
+	reRegisterAfterFailures = 3
 )
 
 var resolutionMap = map[string]int{
@@ -89,12 +96,7 @@ func run(ctx context.Context, ip, outputFlag string, pollInterval time.Duration)
 	profile := defaultProfile
 	uid := uniqueID()
 
-	// Clean up stale registration from a previous run
-	if err := httpclient.Deregister(ip, userID, uid); err != nil {
-		slog.Warn("startup deregister failed — stale entry with different UniqueID? Use --cleanup or curl to remove it manually", "err", err)
-	}
-
-	instanceID, err := httpclient.Register(ip, userID, uid)
+	instanceID, err := registerWithPrinter(ip, uid)
 	if err != nil {
 		return fmt.Errorf("register: %w", err)
 	}
@@ -107,6 +109,7 @@ func run(ctx context.Context, ip, outputFlag string, pollInterval time.Duration)
 	}()
 
 	lastState := snmp.Idle
+	consecutiveFailures := 0
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
@@ -119,9 +122,26 @@ func run(ctx context.Context, ip, outputFlag string, pollInterval time.Duration)
 
 		state, err := snmp.Poll(ip, instanceID, 2*time.Second)
 		if err != nil {
-			slog.Warn("SNMP poll error", "err", err)
+			consecutiveFailures++
+			slog.Warn("SNMP poll error", "err", err, "consecutive", consecutiveFailures)
+
+			// After a run of failures, assume the printer was power-cycled and
+			// dropped our registration — re-register so "My Mac" reappears. If
+			// the printer is still offline the register also fails and we retry
+			// on the next poll.
+			if consecutiveFailures >= reRegisterAfterFailures {
+				if newID, rerr := registerWithPrinter(ip, uid); rerr != nil {
+					slog.Warn("re-registration failed (printer offline?), will retry", "err", rerr)
+				} else {
+					instanceID = newID
+					lastState = snmp.Idle // re-arm PostAppList on the next Triggered
+					consecutiveFailures = 0
+					slog.Info("re-registered after outage", "instanceID", instanceID, "slot", appIndex)
+				}
+			}
 			continue
 		}
+		consecutiveFailures = 0
 
 		if state != lastState {
 			slog.Info("state transition", "from", lastState, "to", state)
@@ -156,7 +176,7 @@ func run(ctx context.Context, ip, outputFlag string, pollInterval time.Duration)
 
 			outDir := outputFlag
 			if outDir == "" {
-				outDir = activeUserDesktop()
+				outDir = expandHome("~/Desktop")
 			}
 
 			actualFormat := sel.Format
@@ -209,15 +229,18 @@ func downloadAndSave(ip, output string, resolution int, format string) error {
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		return fmt.Errorf("write file: %w", err)
 	}
-	// When running as root, chown the file to match the output directory's owner
-	// so the user can manage the file in Finder without authenticating.
-	if info, err := os.Stat(output); err == nil {
-		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-			os.Chown(path, int(stat.Uid), int(stat.Gid))
-		}
-	}
 	slog.Info("scan saved", "path", path, "pages", len(pages), "format", ext, "bytes", len(data))
 	return nil
+}
+
+// registerWithPrinter clears any stale entry then registers this machine,
+// returning the InstanceID the printer assigns. Used at startup and to recover
+// after the printer is power-cycled.
+func registerWithPrinter(ip, uid string) (int, error) {
+	if err := httpclient.Deregister(ip, userID, uid); err != nil {
+		slog.Warn("deregister before register failed — stale entry with different UniqueID? Use --cleanup or curl to remove it manually", "err", err)
+	}
+	return httpclient.Register(ip, userID, uid)
 }
 
 func main() {
@@ -253,36 +276,6 @@ func main() {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
 	}
-}
-
-// consoleUser returns the username of the user currently logged in at the
-// Mac's display. Uses /dev/console, which reflects fast user switching correctly.
-func consoleUser() (string, error) {
-	out, err := exec.Command("stat", "-f", "%Su", "/dev/console").Output()
-	if err != nil {
-		return "", err
-	}
-	u := strings.TrimSpace(string(out))
-	if u == "" || u == "root" {
-		return "", fmt.Errorf("no interactive user at console")
-	}
-	return u, nil
-}
-
-// activeUserDesktop returns the Desktop path for the currently active console
-// user. Falls back to the daemon's own home directory if detection fails.
-func activeUserDesktop() string {
-	username, err := consoleUser()
-	if err != nil {
-		slog.Warn("console user detection failed, falling back to daemon home", "err", err)
-		return expandHome("~/Desktop")
-	}
-	u, err := user.Lookup(username)
-	if err != nil {
-		slog.Warn("user lookup failed", "user", username, "err", err)
-		return expandHome("~/Desktop")
-	}
-	return filepath.Join(u.HomeDir, "Desktop")
 }
 
 func expandHome(path string) string {
