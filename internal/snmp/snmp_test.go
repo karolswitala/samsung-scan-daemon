@@ -57,42 +57,19 @@ func startMockSNMP(t *testing.T, resp []byte) int {
 
 func poll(t *testing.T, resp []byte) State {
 	t.Helper()
-	p := startMockSNMP(t, resp)
-	state, err := pollOnPort("127.0.0.1", 255, time.Second, p)
+	state, err := pollLocal(t, resp, 255, time.Second)
 	if err != nil {
 		t.Fatalf("poll error: %v", err)
 	}
 	return state
 }
 
-// pollOnPort is like Poll but with a custom port — used only in tests.
-func pollOnPort(ip string, instanceID int, timeout time.Duration, udpPort int) (State, error) {
-	req := buildGetRequest(instanceID)
-	addr := net.JoinHostPort(ip, itoa(udpPort))
-	conn, err := net.DialTimeout("udp", addr, timeout)
-	if err != nil {
-		return Idle, err
-	}
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(timeout))
-	if _, err := conn.Write(req); err != nil {
-		return Idle, err
-	}
-	buf := make([]byte, 1024)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return Idle, nil
-	}
-	val := parseResponse(buf[:n])
-	switch {
-	case bytesEqual(val, []byte{0x00, 0x00, 0x00, 0x01}),
-		bytesEqual(val, []byte{0x01, 0x00, 0x00, 0x00}):
-		return Triggered, nil
-	case bytesEqual(val, []byte{0x00, 0x00, 0x00, 0x02}),
-		bytesEqual(val, []byte{0x02, 0x00, 0x00, 0x00}):
-		return Ready, nil
-	}
-	return Idle, nil
+// pollLocal points the real pollAddr at a mock server on an ephemeral port.
+// Poll itself hardcodes the privileged port 161, which tests cannot bind.
+func pollLocal(t *testing.T, resp []byte, instanceID int, timeout time.Duration) (State, error) {
+	t.Helper()
+	p := startMockSNMP(t, resp)
+	return pollAddr(net.JoinHostPort("127.0.0.1", itoa(p)), instanceID, timeout)
 }
 
 func itoa(n int) string {
@@ -134,14 +111,17 @@ func TestParseReady_LittleEndian(t *testing.T) {
 	}
 }
 
-func TestNoSuchNameReturnsIdle(t *testing.T) {
-	state := poll(t, wrapNoSuchName())
+func TestNoSuchNameReturnsError(t *testing.T) {
+	state, err := pollLocal(t, wrapNoSuchName(), 255, time.Second)
+	if err != ErrNoResponse {
+		t.Errorf("want ErrNoResponse for noSuchName, got %v", err)
+	}
 	if state != Idle {
 		t.Errorf("want Idle for noSuchName, got %s", state)
 	}
 }
 
-func TestTimeoutReturnsIdle(t *testing.T) {
+func TestTimeoutReturnsError(t *testing.T) {
 	// Start a server that never replies
 	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -150,7 +130,10 @@ func TestTimeoutReturnsIdle(t *testing.T) {
 	defer conn.Close()
 	p := conn.LocalAddr().(*net.UDPAddr).Port
 
-	state, _ := pollOnPort("127.0.0.1", 255, 100*time.Millisecond, p)
+	state, err := pollAddr(net.JoinHostPort("127.0.0.1", itoa(p)), 255, 100*time.Millisecond)
+	if err != ErrNoResponse {
+		t.Errorf("want ErrNoResponse on timeout, got %v", err)
+	}
 	if state != Idle {
 		t.Errorf("want Idle on timeout, got %s", state)
 	}

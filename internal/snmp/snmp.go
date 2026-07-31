@@ -13,14 +13,23 @@
 // an INTEGER; both tags are accepted. Both big-endian and little-endian 4-byte
 // encodings are observed in practice and both are handled.
 //
-// On timeout or any network error Poll returns Idle — a missing response is
-// treated as "no activity" rather than a fatal error.
+// Poll distinguishes "the printer answered for our OID" from "it didn't": on a
+// read timeout, or when the response carries no value for our OID (the printer
+// forgot our registration / noSuchName), Poll returns ErrNoResponse. Callers use
+// this to detect that the printer was power-cycled and re-register.
 package snmp
 
 import (
+	"errors"
 	"net"
 	"time"
 )
+
+// ErrNoResponse means the printer did not return a usable value for our OID —
+// either it never answered (timeout) or it answered without our registration's
+// value (e.g. after a power-cycle dropped the Scan2PC table). It is distinct from
+// a genuine Idle state, which arrives as (Idle, nil).
+var ErrNoResponse = errors.New("snmp: no response for OID")
 
 // OID: 1.3.6.1.4.1.236.11.5.11.81.11.7.2.1.2.{InstanceID}
 var oidBase = []int{1, 3, 6, 1, 4, 1, 236, 11, 5, 11, 81, 11, 7, 2, 1, 2}
@@ -128,11 +137,21 @@ func parseResponse(data []byte) []byte {
 }
 
 // Poll queries the printer's scan-state OID and returns the current State.
-// On timeout or any network error, Idle is returned.
+// A parsed value returns (state, nil). A dial/write failure returns the raw
+// network error. A read timeout, or a response that carries no value for our OID
+// (the printer forgot our registration), returns (Idle, ErrNoResponse).
 func Poll(ip string, instanceID int, timeout time.Duration) (State, error) {
+	return pollAddr(net.JoinHostPort(ip, port), instanceID, timeout)
+}
+
+// pollAddr is Poll against an explicit host:port. Poll always targets the
+// printer's privileged port 161, which a test cannot bind, so tests call this
+// directly to reach a mock server on an ephemeral port — exercising the real
+// request/parse logic rather than a copy of it.
+func pollAddr(addr string, instanceID int, timeout time.Duration) (State, error) {
 	req := buildGetRequest(instanceID)
 
-	conn, err := net.DialTimeout("udp", net.JoinHostPort(ip, port), timeout)
+	conn, err := net.DialTimeout("udp", addr, timeout)
 	if err != nil {
 		return Idle, err
 	}
@@ -146,15 +165,22 @@ func Poll(ip string, instanceID int, timeout time.Duration) (State, error) {
 	buf := make([]byte, 1024)
 	n, err := conn.Read(buf)
 	if err != nil {
-		// Timeout is normal (printer offline or wrong OID) — return Idle silently.
-		return Idle, nil
+		// No reply (printer offline or unreachable) — signal it so the caller
+		// can decide whether to re-register.
+		return Idle, ErrNoResponse
 	}
 
-	return parseState(buf[:n]), nil
+	val := parseResponse(buf[:n])
+	if val == nil {
+		// Printer answered but our OID has no value (e.g. noSuchName after a
+		// power-cycle dropped the registration).
+		return Idle, ErrNoResponse
+	}
+	return parseValue(val), nil
 }
 
-func parseState(data []byte) State {
-	val := parseResponse(data)
+// parseValue maps a 4-byte OID value (big- or little-endian) to a State.
+func parseValue(val []byte) State {
 	switch {
 	case bytesEqual(val, []byte{0x00, 0x00, 0x00, 0x01}),
 		bytesEqual(val, []byte{0x01, 0x00, 0x00, 0x00}):
