@@ -96,7 +96,7 @@ func run(ctx context.Context, ip, outputFlag string, pollInterval time.Duration)
 	profile := defaultProfile
 	uid := uniqueID()
 
-	instanceID, err := registerWithPrinter(ip, uid)
+	instanceID, err := registerWithPrinter(ip, uid, false)
 	consecutiveFailures := 0
 	if err != nil {
 		// The printer may be off or asleep at startup. Don't exit (a fatal exit
@@ -129,25 +129,39 @@ func run(ctx context.Context, ip, outputFlag string, pollInterval time.Duration)
 		state, err := snmp.Poll(ip, instanceID, 2*time.Second)
 		if err != nil {
 			consecutiveFailures++
-			slog.Warn("SNMP poll error", "err", err, "consecutive", consecutiveFailures)
+			// Log the outage once at WARN, then keep the per-poll repeats at DEBUG
+			// so a long outage doesn't flood the log.
+			if consecutiveFailures == 1 {
+				slog.Warn("printer unreachable — polling until it returns", "err", err)
+			} else {
+				slog.Debug("SNMP poll error", "err", err, "consecutive", consecutiveFailures)
+			}
 
 			// After a run of failures, assume the printer was power-cycled and
 			// dropped our registration — re-register so "My Mac" reappears. If
 			// the printer is still offline the register also fails and we retry
-			// on the next poll.
+			// on the next poll. Only the first attempt of an outage is a WARN.
 			if consecutiveFailures >= reRegisterAfterFailures {
-				if newID, rerr := registerWithPrinter(ip, uid); rerr != nil {
-					slog.Warn("re-registration failed (printer offline?), will retry", "err", rerr)
+				quiet := consecutiveFailures > reRegisterAfterFailures
+				if newID, rerr := registerWithPrinter(ip, uid, quiet); rerr != nil {
+					if quiet {
+						slog.Debug("re-registration retry failed", "err", rerr, "consecutive", consecutiveFailures)
+					} else {
+						slog.Warn("re-registration failed (printer offline?), retrying each poll until it returns", "err", rerr)
+					}
 				} else {
 					instanceID = newID
 					lastState = snmp.Idle // re-arm PostAppList on the next Triggered
+					slog.Info("re-registered after outage", "instanceID", instanceID, "slot", appIndex, "afterFailedPolls", consecutiveFailures)
 					consecutiveFailures = 0
-					slog.Info("re-registered after outage", "instanceID", instanceID, "slot", appIndex)
 				}
 			}
 			continue
 		}
-		consecutiveFailures = 0
+		if consecutiveFailures > 0 {
+			slog.Info("printer reachable again", "afterFailedPolls", consecutiveFailures)
+			consecutiveFailures = 0
+		}
 
 		if state != lastState {
 			slog.Info("state transition", "from", lastState, "to", state)
@@ -241,10 +255,16 @@ func downloadAndSave(ip, output string, resolution int, format string) error {
 
 // registerWithPrinter clears any stale entry then registers this machine,
 // returning the InstanceID the printer assigns. Used at startup and to recover
-// after the printer is power-cycled.
-func registerWithPrinter(ip, uid string) (int, error) {
+// after the printer is power-cycled. When quiet is true the deregister warning is
+// demoted to debug — during an ongoing outage the deregister fails every retry
+// with a connectivity error, which is noise, not a stale-entry problem.
+func registerWithPrinter(ip, uid string, quiet bool) (int, error) {
 	if err := httpclient.Deregister(ip, userID, uid); err != nil {
-		slog.Warn("deregister before register failed — stale entry with different UniqueID? Use --cleanup or curl to remove it manually", "err", err)
+		if quiet {
+			slog.Debug("deregister before register failed", "err", err)
+		} else {
+			slog.Warn("deregister before register failed — stale entry with different UniqueID? Use --cleanup or curl to remove it manually", "err", err)
+		}
 	}
 	return httpclient.Register(ip, userID, uid)
 }
