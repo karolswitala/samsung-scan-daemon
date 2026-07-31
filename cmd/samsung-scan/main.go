@@ -97,11 +97,18 @@ func run(ctx context.Context, ip, outputFlag string, pollInterval time.Duration)
 	uid := uniqueID()
 
 	instanceID, err := registerWithPrinter(ip, uid)
+	consecutiveFailures := 0
 	if err != nil {
-		return fmt.Errorf("register: %w", err)
+		// The printer may be off or asleep at startup. Don't exit (a fatal exit
+		// just crash-loops under launchd and rarely catches a wake window) —
+		// enter the poll loop and let the recovery path register once it's
+		// reachable. Pre-arm the counter so the first failed poll re-registers.
+		slog.Warn("initial registration failed — will keep retrying until the printer is reachable", "err", err)
+		consecutiveFailures = reRegisterAfterFailures
+	} else {
+		slog.Info("registered", "instanceID", instanceID, "slot", appIndex)
+		slog.Info("press Scan → PC → My Mac on the printer to scan")
 	}
-	slog.Info("registered", "instanceID", instanceID, "slot", appIndex)
-	slog.Info("press Scan → PC → My Mac on the printer to scan")
 
 	defer func() {
 		slog.Info("deregistering")
@@ -109,7 +116,6 @@ func run(ctx context.Context, ip, outputFlag string, pollInterval time.Duration)
 	}()
 
 	lastState := snmp.Idle
-	consecutiveFailures := 0
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 

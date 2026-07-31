@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -21,17 +22,21 @@ import (
 // --- Fake implementations of the external dependencies ---
 
 type fakeHTTP struct {
-	registerReturn  int
-	registerReturns []int // optional per-call sequence; falls back to registerReturn
-	registerCalls   int
-	registerErr     error
-	deregisterCalls int
-	appListCalls    []int // appIndex values
-	userSelectRet   httpclient.Selection
+	registerReturn    int
+	registerReturns   []int // optional per-call sequence; falls back to registerReturn
+	registerCalls     int
+	registerErr       error
+	registerFailFirst int // fail the first N Register calls (simulates printer offline at startup)
+	deregisterCalls   int
+	appListCalls      []int // appIndex values
+	userSelectRet     httpclient.Selection
 }
 
 func (f *fakeHTTP) Register(ip, userID, uid string) (int, error) {
 	f.registerCalls++
+	if f.registerCalls <= f.registerFailFirst {
+		return 0, errors.New("simulated register failure (printer offline)")
+	}
 	if f.registerErr != nil {
 		return 0, f.registerErr
 	}
@@ -125,14 +130,14 @@ func runWithDeps(ctx context.Context, ip, output string, profile httpclient.Prof
 	d.http.Deregister(ip, userID, uid)
 
 	instanceID, err := d.http.Register(ip, userID, uid)
+	consecutiveFailures := 0
 	if err != nil {
-		return err
+		consecutiveFailures = reRegisterAfterFailures
 	}
 
 	defer d.http.Deregister(ip, userID, uid)
 
 	lastState := snmp.Idle
-	consecutiveFailures := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -427,6 +432,34 @@ func TestReRegistersAfterOutage(t *testing.T) {
 	last := fs.polledWith[len(fs.polledWith)-1]
 	if last != 7 {
 		t.Errorf("expected polling with new instanceID 7 after re-register, got %d", last)
+	}
+}
+
+func TestSurvivesInitialRegisterFailure(t *testing.T) {
+	tmp := t.TempDir()
+	// Startup Register fails (printer offline/asleep); the recovery Register
+	// returns instanceID 7.
+	fh := &fakeHTTP{registerFailFirst: 1, registerReturn: 7, userSelectRet: makeActiveSelection()}
+	// One failing poll (printer still down), then a successful idle poll.
+	fs := &fakeSNMP{
+		states: []snmp.State{snmp.Idle, snmp.Idle},
+		errs:   []error{snmp.ErrNoResponse, nil},
+	}
+	ft := &fakeTCP{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Must NOT return an error despite the failed startup registration.
+	if err := runWithDeps(ctx, "192.168.1.128", tmp, httpclient.Profile{}, deps{fh, fs, ft}); err != nil {
+		t.Fatalf("daemon exited on startup register failure: %v", err)
+	}
+
+	if fh.registerCalls != 2 {
+		t.Errorf("expected startup + recovery Register (2 calls), got %d", fh.registerCalls)
+	}
+	if last := fs.polledWith[len(fs.polledWith)-1]; last != 7 {
+		t.Errorf("expected polling with recovered instanceID 7, got %d", last)
 	}
 }
 
