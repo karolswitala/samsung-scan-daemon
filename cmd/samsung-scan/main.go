@@ -21,6 +21,11 @@
 // scans. All users share the same printer identity ("My Mac") so exactly one scan
 // target appears on the LCD at all times.
 //
+// If the printer is power-cycled it drops its in-memory Scan-to-PC table, and
+// "My Mac" silently disappears from the LCD menu. The poll loop detects the
+// printer no longer answering for our OID and re-registers once it is reachable
+// again, so the destination reappears without restarting the daemon.
+//
 // SIGINT and SIGTERM trigger a clean shutdown that deregisters this machine from
 // the printer before exiting.
 package main
@@ -48,6 +53,18 @@ import (
 const (
 	userID   = "My Mac"
 	appIndex = 1 // AppList profile slot; must be ≤ MaxUser (10). Independent of S2PC_Regi InstanceID.
+
+	// reRegisterAfterFailures is how many consecutive polls with no usable
+	// response we tolerate before assuming the printer was power-cycled (or went
+	// offline) and re-registering. At the default 3s poll interval this is ~9s.
+	reRegisterAfterFailures = 3
+)
+
+// Indirected so tests can drive run() without a printer or a GUI session.
+// Production always uses the real implementations.
+var (
+	pollFn   = snmp.Poll
+	isActive = isActiveConsoleUser
 )
 
 var resolutionMap = map[string]int{
@@ -114,6 +131,18 @@ func run(ctx context.Context, ip, outputFlag string, pollInterval time.Duration,
 	var instanceID int
 	lastState := snmp.Idle
 
+	// consecutiveFailures counts polls that returned no usable response. It is
+	// deliberately NOT reset when the outage clears registration below: once
+	// registered goes false the loop stops polling, so the count freezes at the
+	// value that tripped the threshold, which is what afterFailedPolls reports on
+	// the recovery log line.
+	consecutiveFailures := 0
+
+	// registerFailures throttles the registration WARN separately, because that
+	// path also runs before we have ever registered — a printer switched off at
+	// login is retried every tick with consecutiveFailures still at 0.
+	registerFailures := 0
+
 	defer func() {
 		if registered {
 			slog.Info("deregistering")
@@ -128,7 +157,7 @@ func run(ctx context.Context, ip, outputFlag string, pollInterval time.Duration,
 		case <-ticker.C:
 		}
 
-		active := isActiveConsoleUser()
+		active := isActive()
 
 		if !registered && active {
 			if guardMAC != "" {
@@ -149,14 +178,29 @@ func run(ctx context.Context, ip, outputFlag string, pollInterval time.Duration,
 
 			id, err := httpclient.Register(ip, userID, uid)
 			if err != nil {
-				slog.Warn("register failed", "err", err)
+				// This retries every tick for as long as the printer is
+				// unreachable — overnight, if it was switched off. Only the
+				// first attempt is a WARN; the rest would flood a log file that
+				// has no rotation.
+				registerFailures++
+				if registerFailures == 1 {
+					slog.Warn("register failed — retrying every poll until the printer answers", "err", err)
+				} else {
+					slog.Debug("register retry failed", "err", err, "consecutiveRegisterFailures", registerFailures)
+				}
 				continue
 			}
+			registerFailures = 0
 			instanceID = id
 			registered = true
 			lastState = snmp.Idle
-			slog.Info("registered", "instanceID", instanceID, "slot", appIndex)
-			slog.Info("press Scan → PC → My Mac on the printer to scan")
+			if consecutiveFailures > 0 {
+				slog.Info("re-registered after outage", "instanceID", instanceID, "slot", appIndex, "afterFailedPolls", consecutiveFailures)
+				consecutiveFailures = 0
+			} else {
+				slog.Info("registered", "instanceID", instanceID, "slot", appIndex)
+				slog.Info("press Scan → PC → My Mac on the printer to scan")
+			}
 			httpclient.PostAppList(ip, appIndex, profile)
 			continue
 		}
@@ -166,6 +210,9 @@ func run(ctx context.Context, ip, outputFlag string, pollInterval time.Duration,
 			httpclient.Deregister(ip, userID, uid)
 			registered = false
 			lastState = snmp.Idle
+			// A user switch is a clean handover, not an outage — clear the count
+			// so registering as the next console user isn't logged as a recovery.
+			consecutiveFailures = 0
 			continue
 		}
 
@@ -174,10 +221,39 @@ func run(ctx context.Context, ip, outputFlag string, pollInterval time.Duration,
 			continue
 		}
 
-		state, err := snmp.Poll(ip, instanceID, 2*time.Second)
+		state, err := pollFn(ip, instanceID, 2*time.Second)
 		if err != nil {
-			slog.Warn("SNMP poll error", "err", err)
+			consecutiveFailures++
+			// Log the outage once at WARN, then keep the per-poll repeats at
+			// DEBUG so a long outage doesn't flood the log.
+			if consecutiveFailures == 1 {
+				slog.Warn("printer unreachable — polling until it returns", "err", err)
+			} else {
+				slog.Debug("SNMP poll error", "err", err, "consecutive", consecutiveFailures)
+			}
+
+			// After a run of failures, assume the printer was power-cycled and
+			// dropped our registration. Clearing `registered` hands recovery to
+			// the registration branch above, so the ARP guard and console-user
+			// check still apply on the way back in.
+			if consecutiveFailures >= reRegisterAfterFailures {
+				// Clear any entry the printer may still be holding for us —
+				// otherwise the re-register can come back DUPLICATE_USER. This
+				// fails with a connectivity error while the printer is still
+				// down, which is expected noise, so it stays at DEBUG.
+				if derr := httpclient.Deregister(ip, userID, uid); derr != nil {
+					slog.Debug("deregister before re-register failed", "err", derr)
+				}
+				registered = false
+				lastState = snmp.Idle
+			}
 			continue
+		}
+		if consecutiveFailures > 0 {
+			// Recovered without ever tripping the threshold — a brief blip, so
+			// the registration is still valid and nothing needs re-registering.
+			slog.Info("printer reachable again", "afterFailedPolls", consecutiveFailures)
+			consecutiveFailures = 0
 		}
 
 		if state != lastState {
