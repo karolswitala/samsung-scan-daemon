@@ -7,31 +7,40 @@ import (
 	"time"
 )
 
-// wrapOctetString builds a minimal SNMPv1 GET-Response wrapping raw4 as OCTET STRING (0x04).
+// wrapResponse builds an SNMPv1 GET-Response for the scan-state OID of instanceID,
+// carrying value (a complete TLV). Same layout as the Samsung M2070W sends,
+// including the community string and the full OID.
+func wrapResponse(instanceID int, errStatus, errIndex byte, value []byte) []byte {
+	arcs := append(append([]int{}, oidBase...), instanceID)
+	varbind := tlv(0x30, concat(encodeOID(arcs), value))
+	pdu := tlv(0xa2, concat(
+		tlv(0x02, []byte{0x01}),      // request-id
+		tlv(0x02, []byte{errStatus}), // error-status
+		tlv(0x02, []byte{errIndex}),  // error-index
+		tlv(0x30, varbind),
+	))
+	return tlv(0x30, concat(tlv(0x02, []byte{0x00}), tlv(0x04, []byte(community)), pdu))
+}
+
+// wrapOctetString builds a GET-Response wrapping raw4 as OCTET STRING (0x04).
 // This matches what the Samsung M2070W actually sends.
 func wrapOctetString(raw4 []byte) []byte {
-	valTLV := append([]byte{0x04, 0x04}, raw4...)
-	oidBytes := []byte{0x06, 0x01, 0x00}
-	varbind := tlv(0x30, append(oidBytes, valTLV...))
-	varbindList := tlv(0x30, varbind)
-	pdu := append(
-		[]byte{0xa2, byte(9 + len(varbindList))},
-		append([]byte{0x02, 0x01, 0x01, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00}, varbindList...)...,
-	)
-	return append([]byte{0x30, byte(3 + len(pdu)), 0x02, 0x01, 0x00}, pdu...)
+	return wrapResponse(255, 0x00, 0x00, tlv(0x04, raw4))
 }
 
 // wrapNoSuchName builds an SNMPv1 GET-Response with error-status=noSuchName(2).
 func wrapNoSuchName() []byte {
-	nullTLV := []byte{0x05, 0x00}
-	oidBytes := []byte{0x06, 0x01, 0x00}
-	varbind := tlv(0x30, append(oidBytes, nullTLV...))
-	varbindList := tlv(0x30, varbind)
-	pdu := append(
-		[]byte{0xa2, byte(9 + len(varbindList))},
-		append([]byte{0x02, 0x01, 0x01, 0x02, 0x01, 0x02, 0x02, 0x01, 0x01}, varbindList...)...,
-	)
-	return append([]byte{0x30, byte(3 + len(pdu)), 0x02, 0x01, 0x00}, pdu...)
+	return wrapResponse(255, 0x02, 0x01, []byte{0x05, 0x00})
+}
+
+// capturedInstance4Idle is a real M2070W response for InstanceID 4 in the idle state.
+// The OID's trailing arcs "2.4" encode as 02 04, which a byte-scanning parser
+// mistook for a 4-byte INTEGER and read as 04 04 00 00.
+var capturedInstance4Idle = []byte{
+	0x30, 0x36, 0x02, 0x01, 0x00, 0x04, 0x06, 'p', 'u', 'b', 'l', 'i', 'c', 0xa2, 0x29, 0x02,
+	0x04, 0x72, 0x75, 0xc1, 0x0a, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x1b, 0x30, 0x19, 0x06,
+	0x11, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x81, 0x6c, 0x0b, 0x05, 0x0b, 0x51, 0x0b, 0x07, 0x02, 0x01,
+	0x02, 0x04, 0x04, 0x04, 0x00, 0x00, 0x00, 0x00,
 }
 
 // startMockSNMP starts a UDP server that sends resp once then stops.
@@ -189,5 +198,30 @@ func TestEncodeOIDMultiByte(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected 0x81 0x6c for arc 236, got: %x", oid)
+	}
+}
+
+func TestParseResponseCapturedInstance4(t *testing.T) {
+	if got := parseResponse(capturedInstance4Idle); !bytesEqual(got, []byte{0x00, 0x00, 0x00, 0x00}) {
+		t.Errorf("want 00 00 00 00, got % x", got)
+	}
+}
+
+func TestParseResponseEveryInstanceID(t *testing.T) {
+	// The value must come from the varbind, never from bytes inside the OID.
+	for id := 1; id <= 300; id++ {
+		for _, raw := range [][]byte{{0x00, 0x00, 0x00, 0x00}, {0x01, 0x00, 0x00, 0x00}, {0x00, 0x00, 0x00, 0x02}} {
+			if got := parseResponse(wrapResponse(id, 0x00, 0x00, tlv(0x04, raw))); !bytesEqual(got, raw) {
+				t.Fatalf("instanceID %d: want % x, got % x", id, raw, got)
+			}
+		}
+	}
+}
+
+func TestParseResponseTruncated(t *testing.T) {
+	for n := 0; n < len(capturedInstance4Idle); n++ {
+		if got := parseResponse(capturedInstance4Idle[:n]); got != nil {
+			t.Fatalf("truncated to %d bytes: want nil, got % x", n, got)
+		}
 	}
 }

@@ -118,13 +118,55 @@ func concat(slices ...[]byte) []byte {
 // parseResponse extracts the 4-byte value from an SNMPv1 GET-Response.
 // The Samsung M2070W returns the state as OCTET STRING (0x04); INTEGER (0x02) is
 // also accepted for compatibility.
+//
+// The message is walked element by element down to the varbind value. Scanning
+// for a tag/length byte pair is not safe: the OID ends in arcs "2.{InstanceID}",
+// so InstanceID 2 or 4 produces bytes that look like a 4-byte INTEGER header.
 func parseResponse(data []byte) []byte {
-	for i := 0; i < len(data)-5; i++ {
-		if (data[i] == 0x02 || data[i] == 0x04) && data[i+1] == 0x04 {
-			return data[i+2 : i+6]
+	_, msg, _ := nth(data, 0)  // Message SEQUENCE
+	_, pdu, _ := nth(msg, 2)   // skip version, community → GetResponse-PDU
+	_, vbl, _ := nth(pdu, 3)   // skip request-id, error-status, error-index → varbind list
+	_, vb, _ := nth(vbl, 0)    // first varbind
+	tag, val, ok := nth(vb, 1) // skip name (OID) → value
+	if !ok || (tag != 0x02 && tag != 0x04) || len(val) != 4 {
+		return nil
+	}
+	return val
+}
+
+// nth returns the tag and value of the n-th (0-based) BER element in b.
+// ok is false if b holds fewer than n+1 complete elements.
+func nth(b []byte, n int) (tag byte, value []byte, ok bool) {
+	for i := 0; ; i++ {
+		tag, value, b, ok = readTLV(b)
+		if !ok || i == n {
+			return tag, value, ok
 		}
 	}
-	return nil
+}
+
+// readTLV splits the first BER element off b, returning its tag, its value and
+// the bytes that follow. ok is false if b is truncated.
+func readTLV(b []byte) (tag byte, value, rest []byte, ok bool) {
+	if len(b) < 2 {
+		return 0, nil, nil, false
+	}
+	n, hdr := int(b[1]), 2
+	if n&0x80 != 0 { // long form: low 7 bits give the number of length bytes
+		k := n & 0x7f
+		if k == 0 || k > 2 || len(b) < 2+k {
+			return 0, nil, nil, false
+		}
+		n = 0
+		for _, lb := range b[2 : 2+k] {
+			n = n<<8 | int(lb)
+		}
+		hdr += k
+	}
+	if len(b) < hdr+n {
+		return 0, nil, nil, false
+	}
+	return b[0], b[hdr : hdr+n], b[hdr+n:], true
 }
 
 // Poll queries the printer's scan-state OID and returns the current State.

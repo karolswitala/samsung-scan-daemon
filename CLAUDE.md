@@ -58,6 +58,13 @@ does not exist; `exec.LookPath` fails at startup, the guard is disabled with a s
 Info log, and the daemon proceeds normally. Do not expect the flag to have any effect
 in non-macOS builds.
 
+### 5. SNMP response must be parsed structurally
+`parseResponse()` in `internal/snmp/snmp.go` walks the BER elements down to the varbind
+value. Do not replace it with a scan for a `02 04`/`04 04` tag-length pair: the OID ends
+in arcs `2.{InstanceID}`, so InstanceID 2 or 4 (common right after the printer
+power-cycles and its counter resets) matches first, every poll reads as idle, and the
+printer LCD hangs on "Connecting". Test helpers build responses with the full OID.
+
 ## Architecture
 ```
 cmd/samsung-scan/main.go       — daemon loop, signal handling, format routing
