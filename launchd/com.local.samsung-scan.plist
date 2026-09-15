@@ -9,7 +9,7 @@
     <string>Aqua</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/samsung-scan</string>
+        <string>__HOME__/.local/bin/samsung-scan</string>
         <string>--ip</string>
         <string>192.168.1.128</string>
     </array>

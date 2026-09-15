@@ -1,14 +1,16 @@
 #!/bin/bash
 set -e
 
+cd "$(dirname "$0")"
+
 BINARY=dist/samsung-scan-macos
-DEST=/usr/local/bin/samsung-scan
+DEST="$HOME/.local/bin/samsung-scan"
+LEGACY_DEST=/usr/local/bin/samsung-scan
 PLIST=launchd/com.local.samsung-scan.plist
 PLIST_DEST="$HOME/Library/LaunchAgents/com.local.samsung-scan.plist"
 DEFAULT_IP="192.168.1.128"
-GITHUB_REPO="karol/samsung-scan"
+GITHUB_REPO="karolswitala/samsung-scan-daemon"
 RELEASE_URL="https://github.com/${GITHUB_REPO}/releases/latest/download/samsung-scan-macos"
-TMP_BINARY=/tmp/samsung-scan-download
 
 # If upgrading from the old root LaunchDaemon, remove it first:
 #   sudo launchctl unload /Library/LaunchDaemons/com.local.samsung-scan.plist
@@ -42,27 +44,31 @@ else
     PRINTER_MAC=$(echo "$ARP_OUT" | awk '{for(i=1;i<=NF;i++) if($i=="at") {print $(i+1); exit}}')
 fi
 
-# Install the binary only if it is not already present.
-# On a multi-user Mac the first user installs it; subsequent users skip this.
-if [ ! -f "$DEST" ]; then
-    if curl -fsSL "$RELEASE_URL" -o "$TMP_BINARY" 2>/dev/null; then
-        echo "Downloaded pre-built binary from GitHub Releases"
-        chmod +x "$TMP_BINARY"
-        sudo mkdir -p "$(dirname "$DEST")"
-        sudo install -m 755 "$TMP_BINARY" "$DEST"
-        rm -f "$TMP_BINARY"
-    else
-        echo "No pre-built release found — building from source (Go required)."
-        echo "If Go is not installed, download the binary from:"
-        echo "  https://github.com/${GITHUB_REPO}/releases"
-        make build-mac
-        echo "Installing binary to $DEST"
-        sudo mkdir -p "$(dirname "$DEST")"
-        sudo cp "$BINARY" "$DEST"
-    fi
+# Always (re)install the binary so it matches the plist written below.
+# Build from this checkout when Go is available; otherwise use the latest release.
+if command -v go >/dev/null 2>&1; then
+    echo "Building from source"
+    make build-mac
+    SRC="$BINARY"
 else
-    echo "Binary already installed at $DEST — skipping"
+    TMP_BINARY=$(mktemp -t samsung-scan)
+    trap 'rm -f "$TMP_BINARY"' EXIT
+    echo "Go not found — downloading latest release from GitHub"
+    if ! curl -fsSL "$RELEASE_URL" -o "$TMP_BINARY"; then
+        echo "Download failed. Install Go (brew install go) and re-run, or get the binary from:" >&2
+        echo "  https://github.com/${GITHUB_REPO}/releases" >&2
+        exit 1
+    fi
+    SRC="$TMP_BINARY"
 fi
+
+# Stop any previous version (it deregisters from the printer on SIGTERM)
+# before replacing its binary.
+launchctl bootout "gui/$(id -u)/com.local.samsung-scan" 2>/dev/null || true
+
+echo "Installing binary to $DEST"
+mkdir -p "$(dirname "$DEST")"
+install -m 755 "$SRC" "$DEST"
 
 echo "Installing LaunchAgent plist to $PLIST_DEST"
 mkdir -p "$(dirname "$PLIST_DEST")"
@@ -87,13 +93,19 @@ else
     echo "  ./install.sh $PRINTER_IP <mac>"
 fi
 
-# Unload any previous version before (re)loading
-launchctl bootout "gui/$(id -u)/com.local.samsung-scan" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST_DEST"
 
 echo ""
 echo "Agent loaded."
+echo "Binary:           $DEST"
 echo "Printer IP:       $PRINTER_IP"
 echo "Output:           ${OUTPUT_DIR:-~/Desktop (default)}"
 echo "To view logs:     tail -f ~/Library/Logs/samsung-scan.log"
 echo "To stop:          launchctl bootout gui/\$(id -u)/com.local.samsung-scan"
+echo "To uninstall:     ./uninstall.sh"
+
+if [ -e "$LEGACY_DEST" ]; then
+    echo ""
+    echo "Note: $LEGACY_DEST is from an older install and is no longer used."
+    echo "Remove it once with:  sudo rm $LEGACY_DEST"
+fi

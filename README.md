@@ -95,16 +95,17 @@ Idle memory footprint: ~8 MB RSS. Static binary, no runtime dependencies.
 
 ## Quick start
 
-### Install from a pre-built release (no Go required)
+### Install as a LaunchAgent (no sudo)
 
 ```bash
-git clone https://github.com/karol/samsung-scan.git
-cd samsung-scan
-./install.sh                   # prompts for printer IP; downloads binary automatically
+git clone https://github.com/karolswitala/samsung-scan-daemon.git
+cd samsung-scan-daemon
+./install.sh                   # prompts for printer IP; builds or downloads the binary
 ```
 
-`install.sh` fetches the latest release binary from GitHub, copies it to
-`/usr/local/bin/samsung-scan`, installs the LaunchAgent, and loads it — all in one step.
+`install.sh` builds the binary from source if Go is on `PATH`, otherwise downloads
+the latest release from GitHub. It installs it to `~/.local/bin/samsung-scan`,
+installs the LaunchAgent, and loads it — all in one step, without `sudo`.
 See [Installing on macOS (launchd)](#installing-on-macos-launchd) for options.
 
 ### Run directly from source
@@ -173,16 +174,19 @@ The script prompts for two things:
    The directory is created automatically. A leading `/` is stripped if present,
    so both `Documents/Scans` and `/Documents/Scans` work.
 
-This builds the binary, copies it to `/usr/local/bin/samsung-scan` (requires
-`sudo` for that one copy), installs the plist under `~/Library/LaunchAgents/`
-with your printer IP, output path, and home directory already substituted, and
-**loads the agent immediately**.
+This builds the binary (or downloads the latest release if Go is not installed),
+installs it to `~/.local/bin/samsung-scan`, installs the plist under
+`~/Library/LaunchAgents/` with your printer IP, output path, and home directory
+already substituted, and **loads the agent immediately**. Nothing is written
+outside your home folder, so no `sudo` is needed.
 
 If the printer is reachable at install time, `install.sh` auto-discovers its
 MAC via ARP and enables the network guard — see [Network guard](#network-guard).
 
-Re-running `./install.sh` is safe — it unloads the old agent before reloading,
-so you can use it to change the IP or output folder at any time.
+Re-running `./install.sh` is safe — it unloads the old agent, replaces the
+binary, and reloads, so you can use it to upgrade or to change the IP or output
+folder at any time. The binary is always reinstalled, so it can never fall
+behind the flags written into the plist.
 
 ### Load / unload / reload
 
@@ -208,12 +212,30 @@ sudo rm /Library/LaunchDaemons/com.local.samsung-scan.plist
 
 Then run `./install.sh` as your normal user.
 
+### Upgrading from a `/usr/local/bin` install
+
+Older versions of `install.sh` put the binary in `/usr/local/bin/samsung-scan`
+using `sudo`. Run `./install.sh` to switch the agent to `~/.local/bin`, then
+remove the old binary once (the script reminds you if it is still there):
+
+```bash
+sudo rm /usr/local/bin/samsung-scan
+```
+
 ### Uninstall
+
+```bash
+./uninstall.sh
+```
+
+This stops the agent (which deregisters it from the printer), runs `--cleanup`
+in case a previous run crashed, and removes the plist and binary. The log file
+is kept. The manual equivalent:
 
 ```bash
 launchctl bootout gui/$(id -u)/com.local.samsung-scan
 rm ~/Library/LaunchAgents/com.local.samsung-scan.plist
-sudo rm /usr/local/bin/samsung-scan
+rm ~/.local/bin/samsung-scan
 ```
 
 ---
@@ -224,8 +246,8 @@ Each macOS account that needs to scan runs `./install.sh` as themselves —
 that's the only difference from a single-user setup. launchd then runs one
 agent per logged-in user, each as that user, each writing to their own Desktop.
 
-The script skips the build and binary copy if `/usr/local/bin/samsung-scan`
-already exists, so the second user doesn't need sudo or Go installed.
+Each user gets their own copy of the binary in `~/.local/bin`, so no `sudo` is
+needed. Each user needs either Go installed or network access to GitHub Releases.
 
 ### How active-user gating works
 
