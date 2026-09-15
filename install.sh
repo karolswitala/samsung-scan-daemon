@@ -63,8 +63,14 @@ else
 fi
 
 # Stop any previous version (it deregisters from the printer on SIGTERM)
-# before replacing its binary.
+# before replacing its binary. bootout returns before launchd has finished
+# tearing the service down, and bootstrapping it again too early fails with
+# "5: Input/output error" — so wait until the label is gone.
 launchctl bootout "gui/$(id -u)/com.local.samsung-scan" 2>/dev/null || true
+for _ in $(seq 1 50); do
+    launchctl print "gui/$(id -u)/com.local.samsung-scan" >/dev/null 2>&1 || break
+    sleep 0.2
+done
 
 echo "Installing binary to $DEST"
 mkdir -p "$(dirname "$DEST")"
